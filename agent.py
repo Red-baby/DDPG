@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import math, numpy as np, torch, torch.nn.functional as F
 import torch.nn as nn
+import os
 from dataclasses import dataclass
 from models import ActorNet, CriticNet
 
@@ -66,6 +67,10 @@ class DDPG:
         self.total_env_steps = 0
         self.total_train_steps = 0
 
+        # 最近一次/EMA的损失（供打印）
+        self.last_loss_c = None
+        self.last_loss_a = None
+
     @torch.no_grad()
     def select_action(self, s: torch.Tensor, explore: bool) -> int:
         # s: [D]; 输出离散 QP（用 cfg.qp_min/max 映射）
@@ -85,7 +90,7 @@ class DDPG:
 
     def train_step(self):
         if len(self.buf) < max(self.cfg.batch_size, self.cfg.warmup_steps):
-            return
+            return None
         s, a, r, s2, d = self.buf.sample(self.cfg.batch_size)
         s  = s.to(self.device); a = a.to(self.device); r = r.to(self.device)
         s2 = s2.to(self.device); d = d.to(self.device)
@@ -95,12 +100,16 @@ class DDPG:
             q2 = self.critic_tgt(s2, a2)
             y  = r + self.cfg.gamma * (1.0 - d) * q2
         q = self.critic(s, a)
-        loss_c = F.mse_loss(q, y)
-        self.opt_c.zero_grad(set_to_none=True); loss_c.backward(); self.opt_c.step()
+        loss_c = F.smooth_l1_loss(q, y)       # Huber，默认 δ=1
+        self.opt_c.zero_grad(set_to_none=True); loss_c.backward();
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.opt_c.step()
 
         a_pi = self.actor(s)
         loss_a = - self.critic(s, a_pi).mean()
-        self.opt_a.zero_grad(set_to_none=True); loss_a.backward(); self.opt_a.step()
+        self.opt_a.zero_grad(set_to_none=True); loss_a.backward();
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        self.opt_a.step()
 
         with torch.no_grad():
             for p, pt in zip(self.actor.parameters(), self.actor_tgt.parameters()):
@@ -109,3 +118,34 @@ class DDPG:
                 pt.data.mul_(1.0 - self.cfg.tau).add_(self.cfg.tau * p.data)
 
         self.total_train_steps += 1
+
+        # 记录最近损失（供外层EMA显示）
+        self.last_loss_c = float(loss_c.item())
+        self.last_loss_a = float(loss_a.item())
+        return self.last_loss_c, self.last_loss_a
+
+    # ====== 保存/加载，用于每epoch持久化 ======
+    def save_checkpoint(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "actor_tgt": self.actor_tgt.state_dict(),
+            "critic_tgt": self.critic_tgt.state_dict(),
+            "opt_a": self.opt_a.state_dict(),
+            "opt_c": self.opt_c.state_dict(),
+            "env_steps": self.total_env_steps,
+            "train_steps": self.total_train_steps,
+            "cfg": getattr(self.cfg, "__dict__", None),
+        }, path)
+
+    def load_checkpoint(self, path: str, map_location=None):
+        ckpt = torch.load(path, map_location=map_location or self.device)
+        self.actor.load_state_dict(ckpt["actor"])
+        self.critic.load_state_dict(ckpt["critic"])
+        self.actor_tgt.load_state_dict(ckpt["actor_tgt"])
+        self.critic_tgt.load_state_dict(ckpt["critic_tgt"])
+        self.opt_a.load_state_dict(ckpt["opt_a"])
+        self.opt_c.load_state_dict(ckpt["opt_c"])
+        self.total_env_steps = int(ckpt.get("env_steps", 0))
+        self.total_train_steps = int(ckpt.get("train_steps", 0))

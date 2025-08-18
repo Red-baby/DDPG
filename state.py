@@ -108,6 +108,7 @@ class StateBuilder:
         self.norm.update(vec)
         nvec = self.norm.normalize(vec, clip=self.cfg.feature_clip)
 
+        # 额外把 score_* 也放进 meta 供 reward 门控使用
         meta = {
             "doc": _int(rq.get("doc", -1)),
             "poc": _int(rq.get("poc", -1)),  # 兼容：若需要也提供
@@ -119,6 +120,9 @@ class StateBuilder:
             "mg_index": _int(rq.get("mg_index", 0)),
             "base_q": int(s["base_q"]),
             "bits_plan_frame": _float(rq.get("bits_plan_frame", 0.0)),  # 可用于reward（可选）
+            "score_max": _float(rq.get("score_max", 0.0)),
+            "score_avg": _float(rq.get("score_avg", 0.0)),
+            "score_min": _float(rq.get("score_min", 0.0)),
         }
         return nvec, meta
 
