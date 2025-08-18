@@ -44,6 +44,13 @@ class RLRunner:
         self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
         self.pending: Dict[int, Pending] = {}
         self.last_doc_in_mg: Optional[int] = None
+        # ==== 预算统计 ====
+        self.mg_bits_tgt_total = 0.0
+        self._seen_mg_ids = set()  # 只对每个 mg_id 计一次
+        self._gop_plan_bits = {}  # gop_id -> 累计计划预算（sum of mg_bits_tgt）
+        self._gop_init_rem = {}  # gop_id -> 第一次看到的 gop_bits_rem 快照
+        self._curr_gop_id = 0
+        self._last_frames_left_gop = None
 
     def serve_loop(self, stop_evt):
         print(f"[RL] watching: {self.cfg.rl_dir} | mode={self.cfg.mode}")
@@ -94,6 +101,30 @@ class RLRunner:
             if doc < 0:
                 print(f"[RL][WARN] rq without doc: {rq_path}")
                 try_remove(rq_path); continue
+            # ==== GOP 边界检测（frames_left_gop 回跳/增大 -> 新 GOP）====
+            flg = _int(rq.get("frames_left_gop", -1))
+            if self._last_frames_left_gop is None:
+                self._last_frames_left_gop = flg
+                # 首次进入：记录 init_rem 一次
+                if flg >= 0 and 0 not in self._gop_init_rem:
+                    self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
+            else:
+                if flg > self._last_frames_left_gop:
+                    # 进入新 GOP
+                    self._curr_gop_id += 1
+                    # 为新 GOP 记录一次 gop_bits_rem 初始快照
+                    self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
+                self._last_frames_left_gop = flg
+
+            # ==== mini-GOP 只记一次：依赖 mg_id ====
+            mg_id = _int(rq.get("mg_id", -1))
+            if mg_id >= 0 and mg_id not in self._seen_mg_ids:
+                self._seen_mg_ids.add(mg_id)
+                mg_bits_tgt = _float(rq.get("mg_bits_tgt", 0.0))
+                self.mg_bits_tgt_total += mg_bits_tgt
+
+                # 同时把本 mini-GOP 的目标预算计入“当前 GOP 的计划预算”
+                self._gop_plan_bits[self._curr_gop_id] = self._gop_plan_bits.get(self._curr_gop_id, 0.0) + mg_bits_tgt
 
             explore = (self.cfg.mode == "train")
             qp = self.agent.select_action(s, explore=explore)

@@ -36,7 +36,7 @@ def parse_args():
         "--parallel-frames|1|"
         "--bitrate|2125"
     ])
-    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--mode", type=str, default="train", choices=["train", "infer"])
     ap.add_argument("--encoder", type=str, default=r"E:\Git\qav1_ori\qav1\build\vs2022\x64\Release\qav1enc.exe")
     return ap.parse_args()
@@ -80,6 +80,26 @@ def main():
                 if cfg.kill_encoder_on_exit and (enc.poll() is None):
                     enc.kill()
                 mon_thr.join(timeout=1.0)
+        # === Epoch 结束统计 ===
+        plan_total = sum(runner._gop_plan_bits.values())
+        initrem_total = sum(runner._gop_init_rem.values())
+        print(f"[STATS] Epoch {ep + 1} 结束：")
+        print(f"  - miniGOP 计划预算总和 = {runner.mg_bits_tgt_total:.2f}")
+        print(f"  - GOP 计划预算总和     = {plan_total:.2f}  (sum of mg_bits_tgt over mg_id)")
+        print(f"  - GOP 初始剩余总和     = {initrem_total:.2f}  (first snapshot of gop_bits_rem)")
+
+        for gid in sorted(set(list(runner._gop_plan_bits.keys()) + list(runner._gop_init_rem.keys()))):
+            plan = runner._gop_plan_bits.get(gid, 0.0)
+            initr = runner._gop_init_rem.get(gid, 0.0)
+            print(f"    GOP #{gid}: plan={plan:.2f}, init_rem={initr:.2f}")
+
+        # 重置统计
+        runner.mg_bits_tgt_total = 0.0
+        runner._seen_mg_ids.clear()
+        runner._gop_plan_bits.clear()
+        runner._gop_init_rem.clear()
+        runner._curr_gop_id = 0
+        runner._last_frames_left_gop = None
 
     print("[MAIN] all epochs done. bye.")
 

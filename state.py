@@ -91,11 +91,11 @@ class StateBuilder:
         self._maybe_cold_start(rq)
 
         s = {
-            "gop_bits_rem":   _float(rq.get("gop_bits_rem", 0.0)),
+            "gop_bits_rem":   _float(rq.get("gop_bits_rem", 0.0))/15,
             "frames_left_gop": _float(rq.get("frames_left_gop", 0.0)),
-            "gop_credit":     _float(rq.get("gop_credit", 0.0)),
-            "mg_bits_tgt":    _float(rq.get("mg_bits_tgt", 0.0)),
-            "mg_bits_rem":    _float(rq.get("mg_bits_rem", 0.0)),
+            "gop_credit":     _float(rq.get("gop_credit", 0.0))/15,
+            "mg_bits_tgt":    _float(rq.get("mg_bits_tgt", 0.0))/15,
+            "mg_bits_rem":    _float(rq.get("mg_bits_rem", 0.0))/15,
             "frames_left_mg": _float(rq.get("frames_left_mg", 0.0)),
             "base_q":         _float(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max) / 2)),
             "temporal_id":    _float(rq.get("temporal_id", rq.get("update_type", 0))),
@@ -114,8 +114,8 @@ class StateBuilder:
             "update_type": _int(rq.get("update_type", rq.get("temporal_id", 0))),
             "frames_left_mg": _int(rq.get("frames_left_mg", 0)),
             "frames_left_gop": _int(rq.get("frames_left_gop", 0)),
-            "gop_credit": _float(rq.get("gop_credit", 0.0)),
-            "gop_bits_rem": _float(rq.get("gop_bits_rem", 0.0)),
+            "gop_credit": _float(rq.get("gop_credit", 0.0))/15,
+            "gop_bits_rem": _float(rq.get("gop_bits_rem", 0.0))/15,
             "mg_index": _int(rq.get("mg_index", 0)),
             "base_q": int(s["base_q"]),
             "bits_plan_frame": _float(rq.get("bits_plan_frame", 0.0)),  # 可用于reward（可选）

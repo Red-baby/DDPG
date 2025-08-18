@@ -26,8 +26,8 @@ class Config:
     actor_lr:  float = 2e-4
     critic_lr: float = 2e-4
     batch_size: int = 256
-    replay_size: int = 400_000
-    warmup_steps: int = 100
+    replay_size: int = 2000
+    warmup_steps: int = 200
     train_steps_per_env_step: int = 1
     save_every_steps: int = 20_000
     ckpt_dir: str = "./checkpoints"
