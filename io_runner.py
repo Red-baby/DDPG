@@ -16,6 +16,7 @@ from agent import DDPG
 from reward import compute_reward
 
 def _scan_rq_files(rl_dir: str):
+    # 兼容两种命名：doc_*.rq.json 优先，其次 frame_*.rq.json
     paths = sorted(glob.glob(os.path.join(rl_dir, "doc_*.rq.json")))
     if not paths:
         paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.rq.json")))
@@ -43,18 +44,13 @@ class RLRunner:
         self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
         self.pending: Dict[int, Pending] = {}
         self.last_doc_in_mg: Optional[int] = None
-
-        # mini-GOP 与全局统计（用于强惩罚）
-        self._seen_mg_ids = set()
+        # ==== 预算统计 ====
+        self.mg_bits_tgt_total = 0.0
+        self._seen_mg_ids = set()  # 只对每个 mg_id 计一次
+        self._gop_plan_bits = {}  # gop_id -> 累计计划预算（sum of mg_bits_tgt）
+        self._gop_init_rem = {}  # gop_id -> 第一次看到的 gop_bits_rem 快照
         self._curr_gop_id = 0
         self._last_frames_left_gop = None
-        self.mg_bits_tgt_total = 0.0
-        self._gop_plan_bits = {}
-        self._gop_init_rem = {}
-
-        self.mg_acc: Dict[tuple, dict] = {}  # (gop_id, mg_index) -> {"bits":..,"frames":..,"psnr":..}
-        self.global_bits_sum = 0.0
-        self.global_frames = 0
 
         # 打印相关
         self.epoch_idx = 0
@@ -102,7 +98,7 @@ class RLRunner:
             if not progressed:
                 time.sleep(0.003)
 
-        # 尾声：尽量处理残余反馈
+        # 退出前，尽量处理残余反馈
         for _ in range(200):
             any_left = self.handle_feedbacks()
             if not any_left:
@@ -121,32 +117,46 @@ class RLRunner:
                 try_remove(rq_path); continue
 
             s, meta = self.sb.build(rq)
-
-            # GOP 边界检测
+            # 主键用 doc；若缺失则退化用 poc；再不行从文件名解析
+            doc = _int(meta.get("doc", -1))
+            if doc < 0:
+                doc = _int(rq.get("doc", -1))
+            if doc < 0:
+                # 从文件名提取数字
+                base = os.path.basename(rq_path)
+                doc = _int(''.join([c for c in base if c.isdigit()]), -1)
+            if doc < 0:
+                print(f"[RL][WARN] rq without doc: {rq_path}")
+                try_remove(rq_path); continue
+            # ==== GOP 边界检测（frames_left_gop 回跳/增大 -> 新 GOP）====
             flg = _int(rq.get("frames_left_gop", -1))
             if self._last_frames_left_gop is None:
                 self._last_frames_left_gop = flg
+                # 首次进入：记录 init_rem 一次
+                if flg >= 0 and 0 not in self._gop_init_rem:
+                    self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
             else:
                 if flg > self._last_frames_left_gop:
+                    # 进入新 GOP
                     self._curr_gop_id += 1
+                    # 为新 GOP 记录一次 gop_bits_rem 初始快照
+                    self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
                 self._last_frames_left_gop = flg
 
-            # 记录当前 gop_id 进入 meta，便于 mini-GOP 统计聚合
-            meta["gop_id"] = self._curr_gop_id
-
-            # mini-GOP 预算累计（用于统计）
+            # ==== mini-GOP 只记一次：依赖 mg_id ====
             mg_id = _int(rq.get("mg_id", -1))
             if mg_id >= 0 and mg_id not in self._seen_mg_ids:
                 self._seen_mg_ids.add(mg_id)
                 mg_bits_tgt = _float(rq.get("mg_bits_tgt", 0.0))
                 self.mg_bits_tgt_total += mg_bits_tgt
+
+                # 同时把本 mini-GOP 的目标预算计入“当前 GOP 的计划预算”
                 self._gop_plan_bits[self._curr_gop_id] = self._gop_plan_bits.get(self._curr_gop_id, 0.0) + mg_bits_tgt
-            if self._curr_gop_id not in self._gop_init_rem:
-                self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
 
             explore = (self.cfg.mode == "train")
             qp = self.agent.select_action(s, explore=explore)
 
+            # 写动作：沿用 rq 的前缀，保证与编码器匹配
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
             try_remove(rq_path)
@@ -154,7 +164,6 @@ class RLRunner:
             denom = max(1, (self.cfg.qp_max - self.cfg.qp_min))
             a01 = float((qp - self.cfg.qp_min) / denom)
 
-            doc = _int(meta.get("doc", -1))
             self.pending[doc] = Pending(
                 state=s, meta=meta, action_a01=a01, qp_used=qp, next_state=None, done=False
             )
@@ -179,6 +188,7 @@ class RLRunner:
                 print(f"[RL][WARN] bad fb json {fb_path}: {e}")
                 try_remove(fb_path); continue
 
+            # 用 doc 匹配 pending
             doc = _int(fb.get("doc", -1))
             if doc not in self.pending:
                 print(f"[RL][WARN] feedback for unknown DOC={doc}")
@@ -186,57 +196,14 @@ class RLRunner:
 
             pend = self.pending[doc]
 
-            # 观测 PSNR（与奖励一致）
-            psnr_y = _float(fb.get("psnr_y", 0.0))
-            if self.cfg.psnr_mode == "yuv":
-                pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
-                psnr_obs = (6*psnr_y + pu + pv) / 8.0 if (psnr_y>0 and pu>0 and pv>0) else psnr_y
-            else:
-                psnr_obs = psnr_y
+            # 奖励：传入上一帧 PSNR 缓存
+            r = compute_reward(self.cfg, fb, rq_meta=pend.meta, prev_psnr_cached=float(self.sb.prev_psnr))
 
-            bits_obs = _float(fb.get("bits", 0.0))
-            self.global_bits_sum += bits_obs
-            self.global_frames += 1
-
-            # mini-GOP 聚合（用于强惩罚）
-            gop_id = int(pend.meta.get("gop_id", 0))
-            mg_idx = int(pend.meta.get("mg_index", 0))
-            key = (gop_id, mg_idx)
-            acc = self.mg_acc.get(key)
-            if acc is None:
-                acc = {"bits": 0.0, "frames": 0, "psnr": 0.0}
-                self.mg_acc[key] = acc
-            acc["bits"] += bits_obs
-            acc["psnr"] += psnr_obs
-            acc["frames"] += 1
-
-            # 是否 mini-GOP 结束
+            # episode 截止（mini-GOP末尾：frames_left_mg==1）
             done = False
             flm = pend.meta.get("frames_left_mg", None)
             if (flm is not None) and int(flm) == 1:
                 done = True
-
-            mg_info = None
-            if done:
-                frames = max(1, acc["frames"])
-                mg_info = {
-                    "done": True,
-                    "avg_bits": acc["bits"] / frames,
-                    "avg_psnr": acc["psnr"] / frames,
-                    "frames": frames,
-                }
-                # 用完就释放，避免积累
-                self.mg_acc.pop(key, None)
-
-            r = compute_reward(
-                self.cfg,
-                fb,
-                rq_meta=pend.meta,
-                prev_psnr_cached=float(self.sb.prev_psnr),
-                mg_info=mg_info,
-                global_info={"avg_bits": self.global_bits_sum / max(1, self.global_frames),
-                             "frames": self.global_frames}
-            )
 
             if pend.next_state is None:
                 pend.next_state = pend.state.clone() if not done else torch.zeros_like(pend.state)
@@ -249,13 +216,22 @@ class RLRunner:
                 np.array([[1.0 if done else 0.0]], dtype=np.float32)
             )
 
-            # 更新上一帧真实观测（供平滑项使用）
-            self.sb.update_prev_meas(bits=bits_obs, psnr=float(psnr_obs), qp=int(pend.qp_used))
+            # 更新 RL 端“上一帧真实观测”缓存（PSNR）
+            # PSNR选择：按 cfg.psnr_mode 取Y或YUV融合
+            psnr_y = _float(fb.get("psnr_y", 0.0))
+            if self.cfg.psnr_mode == "yuv":
+                pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
+                psnr_obs = (6*psnr_y + pu + pv) / 8.0 if (psnr_y>0 and pu>0 and pv>0) else psnr_y
+            else:
+                psnr_obs = psnr_y
+            self.sb.update_prev_meas(bits=_float(fb.get("bits", 0.0)),
+                                     psnr=float(psnr_obs),
+                                     qp=int(pend.qp_used))
 
             try_remove(fb_path)
             if done:
                 self.last_doc_in_mg = None
-                # 清理过旧 pending
+                # 清除过旧pending，防泄漏
                 ks = sorted(list(self.pending.keys()))
                 for k in ks[:-2]:
                     self.pending.pop(k, None)
