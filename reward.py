@@ -15,59 +15,112 @@ def _mix_psnr_from_fb(cfg, fb: dict) -> float:
 
 def compute_reward(cfg, fb: dict, rq_meta: dict, prev_psnr_cached: float = 0.0) -> float:
     """
-    层次化目标（优先级：PSNR > 稳定 > 比特）：
-      r = w_psnr*(psnr/psnr_norm)  -  smooth_pen  -  bit_gate * bit_dev_pen  -  gop_risk
-    其中 bit_gate 由 PSNR 是否达标控制：psnr>=target → 放大比特要求；否则弱化比特要求。
+    目标层次：PSNR > 稳定 > 比特。
+    - 帧级：优先使用 rq 的 bits_plan_frame 与本帧实际 bits 做偏差（分梯度）；
+            当 norm_pf ≥ over_hard_ratio_frame（如2×）时，叠加“硬惩罚”；
+            PSNR 达标 → 欠码不罚且奖励省码；未达标 → 欠/超都较严格；
+            若 ΔPSNR 很小但超码明显 → 低效超码惩罚。
+    - mini-GOP 级：按“到当前为止的累计超出比例”每帧分梯度惩罚；
+                   若累计已 ≥ mg_over_hard_ratio（如2×），再叠加硬惩罚；
+                   受 PSNR 门控（达标宽松、未达标严格）。
     """
+    # —— 观测 —— #
     psnr = _mix_psnr_from_fb(cfg, fb)
     bits = _float(fb.get("bits", 0.0))
 
-    mg_bits_rem     = _float(rq_meta.get("mg_bits_rem", 0.0))
-    frames_left_mg  = _int(rq_meta.get("frames_left_mg", 0))
-    gop_credit      = _float(rq_meta.get("gop_credit", 0.0))
-    frames_left_gop = _int(rq_meta.get("frames_left_gop", 0))
-    gop_bits_rem    = _float(rq_meta.get("gop_bits_rem", 0.0))
+    # —— rq / meta（动作前视图） —— #
+    plan_pf        = _float(rq_meta.get("bits_plan_frame", 0.0))  # 帧级预估码率（关键）
+    mg_bits_tgt    = _float(rq_meta.get("mg_bits_tgt", 0.0))
+    mg_bits_rem    = _float(rq_meta.get("mg_bits_rem", 0.0))
+    frames_left_mg = _int(rq_meta.get("frames_left_mg", 0))
+    gop_credit     = _float(rq_meta.get("gop_credit", 0.0))
+    frames_left_gop= _int(rq_meta.get("frames_left_gop", 0))
+    gop_bits_rem   = _float(rq_meta.get("gop_bits_rem", 0.0))
 
-    # 目标 PSNR：优先读 rq 传来的 score / 阈值，否则用 cfg.psnr_target_db
-    psnr_target = _float(rq_meta.get("score_avg", 0.0)) or _float(rq_meta.get("score_min", 0.0)) or float(cfg.psnr_target_db)
+    # —— 目标 PSNR —— #
+    psnr_target = float(getattr(cfg, "psnr_target_db", 40.0))
+    psnr_met = (psnr >= psnr_target)
 
-    # mini-GOP 动态目标 BPF
+    # —— 回退 BPF（若缺 bits_plan_frame）+ GOP credit 微调 —— #
     if mg_bits_rem > 0.0 and frames_left_mg >= 1:
         bpf_mg = mg_bits_rem / max(1, frames_left_mg)
     else:
-        bpf_mg = max(cfg.min_bpf, 500.0)  # 兜底
-
-    # GOP 信用软调整（可整体关闭）
+        bpf_mg = max(cfg.min_bpf, 500.0)
     credit_share = 0.0
-    if cfg.use_gop_credit and frames_left_gop >= 1 and abs(gop_credit) > 0.0:
+    if getattr(cfg, "use_gop_credit", True) and frames_left_gop >= 1 and abs(gop_credit) > 0.0:
         credit_share = cfg.alpha_credit_share * (gop_credit / max(1, frames_left_gop))
+    bpf_fallback = max(cfg.min_bpf, bpf_mg + credit_share)
 
-    bpf = max(cfg.min_bpf, bpf_mg + credit_share)
+    # ========== 1) 帧级分梯度偏差（优先 plan_pf） ========== #
+    denom_pf = plan_pf if plan_pf > 0 else bpf_fallback
+    norm_pf = bits / max(1.0, denom_pf)  # 实际/预估
+    over_pf = max(0.0, norm_pf - 1.0)
+    under_pf = max(0.0, 1.0 - norm_pf)
 
-    # 码率偏差罚（基础权重）
-    norm = bits / max(bpf, 1.0)
-    if norm >= 1.0:
-        bit_dev_pen = cfg.w_over * (norm - 1.0) ** 2
+    gate_lo, gate_hi = float(cfg.bit_gate_lo), float(cfg.bit_gate_hi)
+
+    # 达标：欠码不罚 + 省码奖励；超码宽松；未达标：欠/超都较严格
+    if psnr_met:
+        frame_over_pen = gate_lo * cfg.w_over * (over_pf ** 2)
+        frame_under_pen = 0.0
+        bit_saving_bonus = float(getattr(cfg, "w_save_bonus", 0.0)) * under_pf
     else:
-        bit_dev_pen = cfg.w_under * (1.0 - norm) ** 2
+        frame_over_pen = gate_hi * cfg.w_over * (over_pf ** 2)
+        frame_under_pen = gate_hi * cfg.w_under * (under_pf ** 2)
+        bit_saving_bonus = 0.0
 
-    # PSNR 门控后的比特权重倍率
-    bit_gate = (cfg.bit_gate_hi if psnr >= psnr_target else cfg.bit_gate_lo)
+    # 帧级硬惩罚：若该帧 ≥ 指定倍数阈值（默认2×）
+    over_hard_ratio = float(getattr(cfg, "over_hard_ratio_frame", 2.0))
+    if norm_pf >= over_hard_ratio:
+        # 额外叠加一个强惩罚项（与 (norm_pf - over_hard_ratio)^2 成正比）
+        frame_over_hard = float(getattr(cfg, "w_over_hard_frame", 3.0)) * ((norm_pf - over_hard_ratio) ** 2)
+        # 同样受 PSNR 门控
+        frame_over_pen += (gate_lo if psnr_met else gate_hi) * frame_over_hard
 
-    # 平滑（ΔPSNR^2），prev_psnr=0 时不罚
+    # 低效超码惩罚：ΔPSNR 很小却超码明显
     if prev_psnr_cached > 0.0:
-        prev_psnr = prev_psnr_cached
+        d_psnr = psnr - float(prev_psnr_cached)
     else:
-        prev_psnr = psnr
-    d_psnr = (psnr - prev_psnr)
-    smooth_pen = cfg.w_smooth * (d_psnr / max(1e-6, cfg.smooth_ref_db)) ** 2
+        d_psnr = 0.0
+    if over_pf > 0.0 and d_psnr < float(getattr(cfg, "eff_gain_eps", 0.10)):
+        ineff = (1.0 - d_psnr / max(float(getattr(cfg, "eff_gain_eps", 0.10)), 1e-6))  # 0~1
+        frame_ineff_pen = float(getattr(cfg, "w_ineff_over", 1.0)) * over_pf * max(0.0, ineff)
+    else:
+        frame_ineff_pen = 0.0
 
-    # GOP 风险（可随 use_gop_credit 一并关掉）
-    if cfg.use_gop_credit and (gop_credit < 0.0) and (gop_bits_rem > 0.0):
+    # ========== 2) mini-GOP 级累计分梯度惩罚（每帧都计算） ========== #
+    mg_pen = 0.0
+    if mg_bits_tgt > 0.0:
+        used_before = max(0.0, mg_bits_tgt - mg_bits_rem)  # 到上一帧为止已用
+        used_after  = used_before + bits                   # 加上本帧后的累计
+        over_mg = max(0.0, used_after / mg_bits_tgt - 1.0) # 累计超出比例（分梯度）
+
+        # 常规累计惩罚（分梯度，每帧生效）
+        mg_pen = float(getattr(cfg, "w_mg_over", 0.8)) * (over_mg ** 2)
+
+        # 累计严重超出（≥ mg_over_hard_ratio）再叠加强惩罚
+        mg_hard_thr = float(getattr(cfg, "mg_over_hard_ratio", 2.0)) - 1.0
+        if over_mg >= max(0.0, mg_hard_thr):
+            mg_pen += float(getattr(cfg, "w_mg_over_hard", 3.5)) * ((over_mg - mg_hard_thr) ** 2)
+
+        # 仍受 PSNR 门控（达标更宽松）
+        mg_pen *= (gate_lo if psnr_met else gate_hi)
+
+    # ========== 3) 质量稳定（ΔPSNR^2） ========== #
+    prev_psnr = float(prev_psnr_cached) if prev_psnr_cached > 0.0 else psnr
+    dps = (psnr - prev_psnr)
+    smooth_pen = cfg.w_smooth * (dps / max(1e-6, cfg.smooth_ref_db)) ** 2
+
+    # ========== 4) GOP 风险项（保留原逻辑，可整体关闭） ========== #
+    if getattr(cfg, "use_gop_credit", True) and (gop_credit < 0.0) and (gop_bits_rem > 0.0):
         gop_risk_pen = cfg.w_gop_risk * (min(1.5, (-gop_credit / gop_bits_rem)) ** 2)
     else:
         gop_risk_pen = 0.0
 
+    # ========== 5) PSNR 主收益 ========== #
     q_gain = cfg.w_psnr * (psnr / max(1e-6, cfg.psnr_norm))
-    r = q_gain - smooth_pen - bit_gate * bit_dev_pen - gop_risk_pen
-    return float(r)*0.1
+
+    # 汇总（PSNR正向；其余为惩罚；省码给奖励）
+    r = q_gain - smooth_pen - frame_over_pen - frame_under_pen - frame_ineff_pen - mg_pen - gop_risk_pen + bit_saving_bonus
+    return float(r) * 0.1  # 数值缩放，保持 Critic 稳定
+

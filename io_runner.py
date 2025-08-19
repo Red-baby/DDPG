@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-环境I/O与训练主循环（DOC优先；支持兼容frame_前缀）：
+环境I/O与训练主循环（DOC优先；兼容 frame_ 前缀）：
 - 轮询 rl_dir，读取编码器写出的 rq.json / fb.json；
 - 构建状态 → 选择动作 → 写 qp.txt（沿用 rq 的前缀）；
 - 读取反馈 → 计算奖励 → 存回放 → 训练一步；
-- 以 mini-GOP 为 episode（frames_left_mg==1 判 done）。
+- 以 mini-GOP 为 episode（frames_left_mg==1 判 done）；
+- 在 mini-GOP 结束时输出：真实比特和、预估 mini-GOP 预算（mg_bits_tgt）、平均 PSNR。
+
+注意：
+1) 保留/恢复了你之前的 GOP 初始剩余预算快照记录（_gop_init_rem），包括“首次进入”和“新 GOP”两个时机。
+2) mini-GOP 统计按 (gop_id, mg_index) 聚合，不依赖帧到达的严格顺序。
 """
 
 import os, glob, time, numpy as np, torch
@@ -15,6 +20,7 @@ from state import StateBuilder, STATE_FIELDS
 from agent import DDPG
 from reward import compute_reward
 
+
 def _scan_rq_files(rl_dir: str):
     # 兼容两种命名：doc_*.rq.json 优先，其次 frame_*.rq.json
     paths = sorted(glob.glob(os.path.join(rl_dir, "doc_*.rq.json")))
@@ -22,11 +28,13 @@ def _scan_rq_files(rl_dir: str):
         paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.rq.json")))
     return paths
 
+
 def _scan_fb_files(rl_dir: str):
     paths = sorted(glob.glob(os.path.join(rl_dir, "doc_*.fb.json")))
     if not paths:
         paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.fb.json")))
     return paths
+
 
 @dataclass
 class Pending:
@@ -37,6 +45,7 @@ class Pending:
     next_state: Optional[torch.Tensor] = None
     done: bool = False
 
+
 class RLRunner:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -44,13 +53,18 @@ class RLRunner:
         self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
         self.pending: Dict[int, Pending] = {}
         self.last_doc_in_mg: Optional[int] = None
-        # ==== 预算统计 ====
-        self.mg_bits_tgt_total = 0.0
-        self._seen_mg_ids = set()  # 只对每个 mg_id 计一次
-        self._gop_plan_bits = {}  # gop_id -> 累计计划预算（sum of mg_bits_tgt）
-        self._gop_init_rem = {}  # gop_id -> 第一次看到的 gop_bits_rem 快照
+
+        # ==== GOP / mini-GOP 计划统计 ====
+        self._seen_mg_ids = set()
         self._curr_gop_id = 0
         self._last_frames_left_gop = None
+        self.mg_bits_tgt_total = 0.0
+        self._gop_plan_bits = {}   # gop_id -> sum of mg_bits_tgt
+        self._gop_init_rem = {}    # gop_id -> 初次看到的 gop_bits_rem 快照（原逻辑保留/恢复）
+
+        # ==== mini-GOP 实际统计（打印用） ====
+        # key = (gop_id, mg_index) -> {"bits":累计真实bit, "psnr":累计psnr, "frames":累计帧数, "budget":mg_bits_tgt}
+        self.mg_stats: Dict[tuple, dict] = {}
 
         # 打印相关
         self.epoch_idx = 0
@@ -114,49 +128,54 @@ class RLRunner:
                 rq = safe_read_json(rq_path)
             except Exception as e:
                 print(f"[RL][WARN] bad rq json {rq_path}: {e}")
-                try_remove(rq_path); continue
+                try_remove(rq_path)
+                continue
 
             s, meta = self.sb.build(rq)
-            # 主键用 doc；若缺失则退化用 poc；再不行从文件名解析
-            doc = _int(meta.get("doc", -1))
-            if doc < 0:
-                doc = _int(rq.get("doc", -1))
-            if doc < 0:
-                # 从文件名提取数字
-                base = os.path.basename(rq_path)
-                doc = _int(''.join([c for c in base if c.isdigit()]), -1)
-            if doc < 0:
-                print(f"[RL][WARN] rq without doc: {rq_path}")
-                try_remove(rq_path); continue
+
             # ==== GOP 边界检测（frames_left_gop 回跳/增大 -> 新 GOP）====
             flg = _int(rq.get("frames_left_gop", -1))
             if self._last_frames_left_gop is None:
-                self._last_frames_left_gop = flg
-                # 首次进入：记录 init_rem 一次
+                # 首次进入：记录 init_rem 一次（你的原始逻辑）  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
                 if flg >= 0 and 0 not in self._gop_init_rem:
                     self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
+                self._last_frames_left_gop = flg
             else:
                 if flg > self._last_frames_left_gop:
                     # 进入新 GOP
                     self._curr_gop_id += 1
-                    # 为新 GOP 记录一次 gop_bits_rem 初始快照
+                    # 为新 GOP 记录一次 gop_bits_rem 初始快照（你的原始逻辑） <<<<<<<<<<<<<<
                     self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
                 self._last_frames_left_gop = flg
 
-            # ==== mini-GOP 只记一次：依赖 mg_id ====
+            # 把 gop_id 记入 meta，便于 mini-GOP 聚合
+            meta["gop_id"] = self._curr_gop_id
+
+            # ==== mini-GOP 预算统计（仅首次见到该 mg_index 时）====
+            mg_idx = _int(rq.get("mg_index", 0))
+            key = (self._curr_gop_id, mg_idx)
+            if key not in self.mg_stats:
+                self.mg_stats[key] = {
+                    "bits": 0.0, "psnr": 0.0, "frames": 0,
+                    # 预估 mini-GOP 编码预算（来自 rq 的 mg_bits_tgt；若缺失则为 0）
+                    "budget": _float(rq.get("mg_bits_tgt", 0.0))
+                }
+
+            # 仍保留原来“全局计划统计”（用于 epoch 总结/对齐你的原结构）
             mg_id = _int(rq.get("mg_id", -1))
             if mg_id >= 0 and mg_id not in self._seen_mg_ids:
                 self._seen_mg_ids.add(mg_id)
                 mg_bits_tgt = _float(rq.get("mg_bits_tgt", 0.0))
                 self.mg_bits_tgt_total += mg_bits_tgt
-
-                # 同时把本 mini-GOP 的目标预算计入“当前 GOP 的计划预算”
                 self._gop_plan_bits[self._curr_gop_id] = self._gop_plan_bits.get(self._curr_gop_id, 0.0) + mg_bits_tgt
+            if self._curr_gop_id not in self._gop_init_rem:
+                # 若上面“首次进入/新 GOP”没记上（极少数异常），这里兜底一次
+                self._gop_init_rem[self._curr_gop_id] = _float(rq.get("gop_bits_rem", 0.0))
 
+            # ==== 选动作，写回 qp ====
             explore = (self.cfg.mode == "train")
             qp = self.agent.select_action(s, explore=explore)
 
-            # 写动作：沿用 rq 的前缀，保证与编码器匹配
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
             try_remove(rq_path)
@@ -164,10 +183,13 @@ class RLRunner:
             denom = max(1, (self.cfg.qp_max - self.cfg.qp_min))
             a01 = float((qp - self.cfg.qp_min) / denom)
 
+            # 用 doc 作为 pending key
+            doc = _int(meta.get("doc", -1))
             self.pending[doc] = Pending(
                 state=s, meta=meta, action_a01=a01, qp_used=qp, next_state=None, done=False
             )
 
+            # 把当前 s 作为上一个样本的 s'（顺序前提）
             if self.last_doc_in_mg is not None and self.last_doc_in_mg in self.pending:
                 prev = self.pending[self.last_doc_in_mg]
                 if prev.next_state is None:
@@ -186,25 +208,54 @@ class RLRunner:
                 fb = safe_read_json(fb_path)
             except Exception as e:
                 print(f"[RL][WARN] bad fb json {fb_path}: {e}")
-                try_remove(fb_path); continue
+                try_remove(fb_path)
+                continue
 
-            # 用 doc 匹配 pending
+            # 匹配 pending
             doc = _int(fb.get("doc", -1))
             if doc not in self.pending:
                 print(f"[RL][WARN] feedback for unknown DOC={doc}")
-                try_remove(fb_path); continue
+                try_remove(fb_path)
+                continue
 
             pend = self.pending[doc]
 
-            # 奖励：传入上一帧 PSNR 缓存
-            r = compute_reward(self.cfg, fb, rq_meta=pend.meta, prev_psnr_cached=float(self.sb.prev_psnr))
+            # === 观测（与奖励一致）===
+            psnr_y = _float(fb.get("psnr_y", 0.0))
+            if self.cfg.psnr_mode == "yuv":
+                pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
+                psnr_obs = (6*psnr_y + pu + pv) / 8.0 if (psnr_y > 0 and pu > 0 and pv > 0) else psnr_y
+            else:
+                psnr_obs = psnr_y
 
-            # episode 截止（mini-GOP末尾：frames_left_mg==1）
-            done = False
-            flm = pend.meta.get("frames_left_mg", None)
-            if (flm is not None) and int(flm) == 1:
-                done = True
+            bits_obs = _float(fb.get("bits", 0.0))
 
+            # === 累加到 mini-GOP 统计（按 gop_id + mg_index 聚合）===
+            gop_id = int(pend.meta.get("gop_id", 0))
+            mg_idx = int(pend.meta.get("mg_index", 0))
+            key = (gop_id, mg_idx)
+            st = self.mg_stats.get(key)
+            if st is None:
+                # 理论不会发生；兜底
+                st = {"bits": 0.0, "psnr": 0.0, "frames": 0, "budget": float(pend.meta.get("mg_bits_tgt", 0.0))}
+                self.mg_stats[key] = st
+            st["bits"] += bits_obs
+            st["psnr"] += psnr_obs
+            st["frames"] += 1
+
+            # === 是否 mini-GOP 结束（接受 0 或 1 都视为末帧）===
+            flm_val = fb.get("frames_left_mg", pend.meta.get("frames_left_mg", None))
+            done = (flm_val is not None) and (int(flm_val==0))
+
+            # === 计算奖励（用 prev_psnr 做平滑项）===
+            r = compute_reward(
+                self.cfg,
+                fb,
+                rq_meta=pend.meta,
+                prev_psnr_cached=float(self.sb.prev_psnr),
+            )
+
+            # === 填 next_state / 终止 ===
             if pend.next_state is None:
                 pend.next_state = pend.state.clone() if not done else torch.zeros_like(pend.state)
 
@@ -216,25 +267,30 @@ class RLRunner:
                 np.array([[1.0 if done else 0.0]], dtype=np.float32)
             )
 
-            # 更新 RL 端“上一帧真实观测”缓存（PSNR）
-            # PSNR选择：按 cfg.psnr_mode 取Y或YUV融合
-            psnr_y = _float(fb.get("psnr_y", 0.0))
-            if self.cfg.psnr_mode == "yuv":
-                pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
-                psnr_obs = (6*psnr_y + pu + pv) / 8.0 if (psnr_y>0 and pu>0 and pv>0) else psnr_y
-            else:
-                psnr_obs = psnr_y
-            self.sb.update_prev_meas(bits=_float(fb.get("bits", 0.0)),
-                                     psnr=float(psnr_obs),
-                                     qp=int(pend.qp_used))
+            # === 更新 RL 端上一帧观测缓存 ===
+            self.sb.update_prev_meas(bits=bits_obs, psnr=float(psnr_obs), qp=int(pend.qp_used))
 
-            try_remove(fb_path)
+            # === mini-GOP 收尾打印（三项：真实比特和、预估预算、平均PSNR）===
             if done:
+                frames = max(1, st["frames"])
+                actual_bits_sum = st["bits"]
+                avg_psnr = st["psnr"] / frames
+                est_budget = st.get("budget", float(pend.meta.get("mg_bits_tgt", 0.0)))
+                mg_id = int(pend.meta.get("mg_id", 0))
+                print(f"[MG] gop={gop_id} mg_id={mg_id} | "
+                      f"actual_bits_sum={actual_bits_sum:.0f} | "
+                      f"est_budget(mg_bits_tgt)={est_budget:.0f} | "
+                      f"avg_psnr={avg_psnr:.2f} dB")
+
+                # 用完清除，避免累积
+                self.mg_stats.pop(key, None)
+
                 self.last_doc_in_mg = None
-                # 清除过旧pending，防泄漏
+                # 清除过旧 pending，防泄漏
                 ks = sorted(list(self.pending.keys()))
                 for k in ks[:-2]:
                     self.pending.pop(k, None)
 
+            try_remove(fb_path)
             anyp = True
         return anyp

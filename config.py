@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"D:\Python\DDPG\rl_io"
+    rl_dir: str = r"E:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -27,7 +27,7 @@ class Config:
     batch_size: int = 256
     replay_size: int = 2000
     warmup_steps: int = 200
-    train_steps_per_env_step: int = 1
+    train_steps_per_env_step: int = 4
 
     # 检查点
     ckpt_dir: str = "./checkpoints"
@@ -44,7 +44,7 @@ class Config:
     psnr_norm: float = 45.0
     w_psnr: float = 1.5
     # 比特偏差基准权重（会被PSNR门控缩放）
-    w_over: float = 0.10
+    w_over: float = 10
     w_under: float = 0.05
     min_bpf: float = 200.0
 
@@ -55,13 +55,13 @@ class Config:
     # GOP 信用项/风险项
     alpha_credit_share: float = 0.5
     w_gop_risk: float = 0.2
-    use_gop_credit: bool = True  # <<< 宏：关闭后不使用 gop_credit
+    use_gop_credit: bool = False  # <<< 宏：关闭后不使用 gop_credit
 
     # 观测：采用 PSNR（"y" 或 "yuv"）
     psnr_mode: str = "y"  # "y" | "yuv"
 
     # 当 PSNR 达标时更重视省比特；未达标时弱化比特惩罚
-    psnr_target_db: float = 40.0   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
+    psnr_target_db: float = 42.5   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
     bit_gate_hi: float = 1.0       # psnr >= target：比特权重倍率
     bit_gate_lo: float = 0.25      # psnr <  target：比特权重倍率
 
@@ -81,6 +81,23 @@ class Config:
     encoder_log_to_file: bool = True                 # 将编码器 stdout/stderr 落到文件
     encoder_log_dir: str = "./logs/encoder"          # 编码器日志目录
     kill_encoder_on_exit: bool = True
+    print_epoch_gop_stats: bool = False
+    # ===== 帧/mini-GOP 分梯度惩罚与效率相关超参 =====
+    # 帧级：PSNR 达标时，对“省码”（低于预估）给少量正向奖励；未达标时不奖励省码
+    w_save_bonus: float = 0.2
+
+    # 帧级：当该帧实际 ≥ 2× 预估时的“硬惩罚”系数与阈值
+    over_hard_ratio_frame: float = 2.0
+    w_over_hard_frame: float = 3.0
+
+    # 帧级：低效超码（ΔPSNR 很小却高码）惩罚
+    w_ineff_over: float = 1.0
+    eff_gain_eps: float = 0.10  # dB，小于此认为“提升不明显”
+
+    # mini-GOP 级：累计超出分梯度惩罚（每帧都生效）
+    w_mg_over: float = 0.8  # 常规累计超出惩罚（分梯度）
+    mg_over_hard_ratio: float = 2.0  # 累计严重超出阈值（如 ≥2×）
+    w_mg_over_hard: float = 3.5  # 累计严重超出额外惩罚
 
     # ====== 数据（以视频为单位的 epoch）======
     # main.py 会循环这些视频作为多个 epoch
