@@ -246,13 +246,16 @@ class RLRunner:
             # === 是否 mini-GOP 结束（接受 0 或 1 都视为末帧）===
             flm_val = fb.get("frames_left_mg", pend.meta.get("frames_left_mg", None))
             done = (flm_val is not None) and (int(flm_val==0))
-
+            frames_so_far = max(1, st["frames"])
             # === 计算奖励（用 prev_psnr 做平滑项）===
             r = compute_reward(
                 self.cfg,
                 fb,
                 rq_meta=pend.meta,
                 prev_psnr_cached=float(self.sb.prev_psnr),
+                mg_ctx={  # <<< 新增
+                    "frames_so_far": int(frames_so_far),
+                },
             )
 
             # === 填 next_state / 终止 ===

@@ -15,17 +15,16 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rl-dir", type=str, default=Config.rl_dir)
     ap.add_argument("--videos", type=str, nargs="+", default=[
-        "--input|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.yuv|"
+        "--input|D:/Python/DDPG/park_mobile_1920x1080_24.yuv|"
         "--input-res|1920x1080|"
         "--frames|0|"
-        "--o|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.ivf|"
-        "--csv|E:/Git/qav1_ori/qav1/workspace/park"
-        "_mobile_1920x1080_24.csv|"
+        "--o|D:/Python/DDPG/park_mobile_1920x1080_24.ivf|"
+        "--csv|D:/Python/DDPG/park_mobile_1920x1080_24_819.csv|"
         "--bitrate|2125|"
         "--rc-mode|1|"
         "--pass|2|"
-        "--stat-in|E:/Git/qav1_ori/qav1/workspace/1pass.log|"
-        "--stat-out|E:/Git/qav1_ori/qav1/workspace/2pass.log|"
+        "--stat-in|D:/Python/DDPG/1pass.log|"
+        "--stat-out|D:/Python/DDPG/2pass.log|"
         "--score-max|50.5|"
         "--score-avg|40.5|"
         "--score-min|38.5|"
@@ -37,9 +36,9 @@ def parse_args():
         "--parallel-frames|1|"
         "--bitrate|2125"
     ])
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=500)
     ap.add_argument("--mode", type=str, default="train", choices=["train", "infer"])
-    ap.add_argument("--encoder", type=str, default=r"E:\Git\qav1_ori\qav1\build\vs2022\x64\Release\qav1enc.exe")
+    ap.add_argument("--encoder", type=str, default=r"D:/Python/DDPG/qav1enc.exe")
     ap.add_argument("--resume", type=str, default="", help="可选：加载某个 checkpoint 继续训练/推理")
     return ap.parse_args()
 

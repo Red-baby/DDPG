@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"E:\Python\DDPG\rl_io"
+    rl_dir: str = r"D:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -16,7 +16,7 @@ class Config:
     encoder_args: list[str] = field(default_factory=lambda: ["-i", "input.yuv", "-o", "out.ivf"])
 
     # QP 边界（固定常数，不再放入状态）
-    qp_min: int = 30
+    qp_min: int = 80
     qp_max: int = 200
 
     # 训练
@@ -42,14 +42,14 @@ class Config:
 
     # 奖励（PSNR 优先，其次平滑，最后比特）
     psnr_norm: float = 45.0
-    w_psnr: float = 1.5
+    w_psnr: float = 3
     # 比特偏差基准权重（会被PSNR门控缩放）
-    w_over: float = 10
+    w_over: float = 5
     w_under: float = 0.05
     min_bpf: float = 200.0
 
     # 平滑权重略高于比特
-    w_smooth: float = 0.30
+    w_smooth: float = 5.0
     smooth_ref_db: float = 5.0
 
     # GOP 信用项/风险项
@@ -62,8 +62,19 @@ class Config:
 
     # 当 PSNR 达标时更重视省比特；未达标时弱化比特惩罚
     psnr_target_db: float = 42.5   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
+    psnr_min_db: float = 40.0
     bit_gate_hi: float = 1.0       # psnr >= target：比特权重倍率
     bit_gate_lo: float = 0.25      # psnr <  target：比特权重倍率
+
+    # mini-GOP 早超惩罚：越早越重
+    mg_early_amp: float = 1.0  # 放大量，1.0 表示最高可再乘 2 倍（=1+1）
+    mg_early_exp: float = 0.9  # 曲线指数；>1 更偏向最早几帧，<1 更平滑
+
+    # 当 PSNR 未达标时，平滑项的缩放系数（0 = 直接关闭；0.25 = 只保留 25%）
+    w_smooth_under_scale: float = 0.25
+
+    # 可选：随着欠标幅度(以 smooth_ref_db 归一)再额外衰减；0 表示不随欠标变化
+    smooth_under_boost: float = 0.5
 
     # 归一化
     feature_clip: float = 10.0
@@ -98,7 +109,11 @@ class Config:
     w_mg_over: float = 0.8  # 常规累计超出惩罚（分梯度）
     mg_over_hard_ratio: float = 2.0  # 累计严重超出阈值（如 ≥2×）
     w_mg_over_hard: float = 3.5  # 累计严重超出额外惩罚
-
+    # q_gain 分段形状（幅度可按需调）
+    q_between_neg: float = 0.30  #  在 psnr=psnr_min 时，q_gain 约为 -q_between_neg（“略靠近0的负”）
+    q_under_min_scale: float = 1.00  # 低于最低线时的负向斜率（越大越负）
+    q_above_scale: float = 1.00  # 高于 target 的正向斜率（到 psnr_norm 处大约到 +q_above_scale）
+    q_gain_cap: float = 1.00  # 夹紧幅度，限制 q 的绝对值（防止过大）
     # ====== 数据（以视频为单位的 epoch）======
     # main.py 会循环这些视频作为多个 epoch
     video_list: list[str] = None
