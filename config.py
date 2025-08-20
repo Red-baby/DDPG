@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"D:\Python\DDPG\rl_io"
+    rl_dir: str = r"E:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -19,14 +19,26 @@ class Config:
     qp_min: int = 80
     qp_max: int = 200
 
+    # === Algorithm ===
+    algo: str = "td3"  # "ddpg" or "td3"
+
+    # Exploration (online action noise)
+    expl_noise_std: float = 0.15  # 给 select_action 的高斯噪声（取代 OU）
+
+    # TD3 core
+    policy_noise: float = 0.10  # 目标策略平滑噪声 N(0, policy_noise)
+    noise_clip: float = 0.20  # 上述噪声裁剪幅度
+    policy_delay: int = 2  # 每隔多少次 Critic 更新才更新一次 Actor
+    target_discretize: bool = True  # [可选] 目标动作也按 QP 量化再映回 a01，降低“学到的目标”和真实环境不一致
+
     # 训练
     gamma: float = 0.98
     tau:   float = 0.005
-    actor_lr:  float = 2e-4
+    actor_lr:  float = 1e-4
     critic_lr: float = 2e-4
-    batch_size: int = 256
-    replay_size: int = 2000
-    warmup_steps: int = 200
+    batch_size: int = 4
+    replay_size: int = 10000
+    warmup_steps: int = 1000
     train_steps_per_env_step: int = 4
 
     # 检查点
@@ -39,6 +51,8 @@ class Config:
     ou_dt: float = 1.0
     action_eps_train: float = 0.10
     action_eps_infer: float = 0.00
+
+
 
     # 奖励（PSNR 优先，其次平滑，最后比特）
     psnr_norm: float = 45.0

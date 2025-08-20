@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict
 from utils import safe_read_json, safe_write_text, try_remove, now_ms, _float, _int
 from state import StateBuilder, STATE_FIELDS
-from agent import DDPG
+from agent import DDPG,TD3
 from reward import compute_reward
 
 
@@ -50,7 +50,11 @@ class RLRunner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.sb = StateBuilder(cfg)
-        self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
+        algo = str(getattr(self.cfg, "algo", "ddpg")).lower()
+        if algo == "td3":
+            self.agent = TD3(state_dim=len(STATE_FIELDS), cfg=cfg)
+        else:
+            self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
         self.pending: Dict[int, Pending] = {}
         self.last_doc_in_mg: Optional[int] = None
 
