@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"E:\Python\DDPG\rl_io"
+    rl_dir: str = r"D:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,6 +118,31 @@ class Config:
     # 帧级：低效超码（ΔPSNR 很小却高码）惩罚
     w_ineff_over: float = 1.0
     eff_gain_eps: float = 0.10  # dB，小于此认为“提升不明显”
+
+    # 失真项映射
+    q_mid_db = 38.0  # PSNR 中位（数据集大致水平）
+    q_span_db = 2.0  # 每 2dB 作为 1 个尺度 -> tanh(-1..1)
+
+    # 帧级码率项
+    pf_tol = 0.20  # 单帧容忍 ±20%
+    pf_huber_delta = 0.20
+    w_bf = 0.6
+
+    # mini-GOP 级码率项
+    mg_tol = 0.05  # mini-GOP 容忍 ±5%
+    mg_huber_delta = 0.05
+    w_bmg = 1.0
+
+    # 自适应平衡
+    reward_balance_auto = True
+    reward_balance_momentum = 0.95
+    reward_balance_target_mag = 0.8  # 期望两路项的平均幅度
+
+    # 其他
+    w_q = 1.0
+    min_bpf = 500.0
+    reward_clip = 1.5
+    reward_scale = 1.0
 
     # mini-GOP 级：累计超出分梯度惩罚（每帧都生效）
     w_mg_over: float = 0.8  # 常规累计超出惩罚（分梯度）
