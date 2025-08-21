@@ -12,7 +12,7 @@
 2) mini-GOP 统计按 (gop_id, mg_index) 聚合，不依赖帧到达的严格顺序。
 """
 
-import os, glob, time, numpy as np, torch
+import csv, os, glob, time, numpy as np, torch
 from dataclasses import dataclass
 from typing import Optional, Dict
 from utils import safe_read_json, safe_write_text, try_remove, now_ms, _float, _int
@@ -21,18 +21,18 @@ from agent import DDPG,TD3
 from reward import compute_reward
 
 
+
 def _scan_rq_files(rl_dir: str):
-    # 兼容两种命名：doc_*.rq.json 优先，其次 frame_*.rq.json
-    paths = sorted(glob.glob(os.path.join(rl_dir, "doc_*.rq.json")))
-    if not paths:
-        paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.rq.json")))
+
+    paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.rq.json")))
+
     return paths
 
 
 def _scan_fb_files(rl_dir: str):
-    paths = sorted(glob.glob(os.path.join(rl_dir, "doc_*.fb.json")))
-    if not paths:
-        paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.fb.json")))
+
+    paths = sorted(glob.glob(os.path.join(rl_dir, "frame_*.fb.json")))
+
     return paths
 
 
@@ -44,6 +44,7 @@ class Pending:
     qp_used: int
     next_state: Optional[torch.Tensor] = None
     done: bool = False
+    created_at_ms: int = 0
 
 
 class RLRunner:
@@ -57,6 +58,9 @@ class RLRunner:
             self.agent = DDPG(state_dim=len(STATE_FIELDS), cfg=cfg)
         self.pending: Dict[int, Pending] = {}
         self.last_doc_in_mg: Optional[int] = None
+
+        self._rew_ema_q = 0.0  # reward balance: |失真项| 的 EMA
+        self._rew_ema_b = 0.0  # reward balance: |码率项| 的 EMA
 
         # ==== GOP / mini-GOP 计划统计 ====
         self._seen_mg_ids = set()
@@ -73,12 +77,41 @@ class RLRunner:
         # 打印相关
         self.epoch_idx = 0
         self.epoch_total = 0
+        # epoch 内累积器
+        self._ep_loss_sum_a = 0.0
+        self._ep_loss_sum_c = 0.0
+        self._ep_updates = 0
+        # epoch 内“帧级业务指标”累积器
+        self._ep_bits_sum = 0.0
+        self._ep_psnr_sum = 0.0
+        self._ep_frames   = 0
+
+
+        # csv 路径
+        self._metrics_csv = getattr(self.cfg, "metrics_csv", "epoch_losses.csv")
+        self._metrics_csv_inited = False
         self.loss_ema_a = None
         self.loss_ema_c = None
 
     def set_epoch(self, idx: int, total: int):
-        self.epoch_idx = idx
-        self.epoch_total = total
+        # 在“进入新 epoch”前，先把上一轮的均值写入 CSV（epoch_idx>0 才写）
+        if self.epoch_idx > 0 and (self._ep_updates > 0 or self._ep_frames > 0):
+            self._write_epoch_metrics(self.epoch_idx)
+
+        # 更新当前 epoch 标记
+        self.epoch_idx = int(idx)
+        self.epoch_total = int(total)
+
+        # 清零本轮累积器
+        self._ep_loss_sum_a = 0.0
+        self._ep_loss_sum_c = 0.0
+        self._ep_updates = 0
+
+        self._ep_bits_sum = 0.0
+        self._ep_psnr_sum = 0.0
+        self._ep_frames = 0
+        self._rew_ema_q = 0.0
+        self._rew_ema_b = 0.0
 
     def _update_loss_ema(self, ret):
         if ret is None:
@@ -99,8 +132,16 @@ class RLRunner:
             progressed = False
             progressed |= self.handle_requests()
             progressed |= self.handle_feedbacks()
-            if self.cfg.mode == "train":
-                self._update_loss_ema(self.agent.train_step())
+            if self.cfg.mode == "train" and progressed:
+                k = int(getattr(self.cfg, "train_steps_per_env_step", 1))
+                for _ in range(max(1, k)):
+                    ret = self.agent.train_step()
+                    self._update_loss_ema(ret)
+                    if ret is not None:
+                        lc, la = ret
+                        if lc is not None: self._ep_loss_sum_c += float(lc)
+                        if la is not None: self._ep_loss_sum_a += float(la)
+                        self._ep_updates += 1
 
             now = now_ms()
             if now - last_print > int(self.cfg.print_every_sec * 1000):
@@ -190,7 +231,8 @@ class RLRunner:
             # 用 doc 作为 pending key
             doc = _int(meta.get("doc", -1))
             self.pending[doc] = Pending(
-                state=s, meta=meta, action_a01=a01, qp_used=qp, next_state=None, done=False
+                state=s, meta=meta, action_a01=a01, qp_used=qp, next_state=None, done=False,
+                created_at_ms=now_ms()  # <<< 新增
             )
 
             # 把当前 s 作为上一个样本的 s'（顺序前提）
@@ -234,6 +276,11 @@ class RLRunner:
 
             bits_obs = _float(fb.get("bits", 0.0))
 
+            # === 【新增】累计到“本 epoch 帧级指标” ===
+            self._ep_bits_sum += float(bits_obs)
+            self._ep_psnr_sum += float(psnr_obs)
+            self._ep_frames += 1
+
             # === 累加到 mini-GOP 统计（按 gop_id + mg_index 聚合）===
             gop_id = int(pend.meta.get("gop_id", 0))
             mg_idx = int(pend.meta.get("mg_index", 0))
@@ -251,16 +298,22 @@ class RLRunner:
             flm_val = fb.get("frames_left_mg", pend.meta.get("frames_left_mg", None))
             done = (flm_val is not None) and (int(flm_val==0))
             frames_so_far = max(1, st["frames"])
+            mg_ctx = {
+                "frames_so_far": int(frames_so_far),
+                "ema_abs_q": float(self._rew_ema_q),
+                "ema_abs_b": float(self._rew_ema_b),
+            }
             # === 计算奖励（用 prev_psnr 做平滑项）===
             r = compute_reward(
                 self.cfg,
                 fb,
                 rq_meta=pend.meta,
                 prev_psnr_cached=float(self.sb.prev_psnr),
-                mg_ctx={  # <<< 新增
-                    "frames_so_far": int(frames_so_far),
-                },
+                mg_ctx=mg_ctx
             )
+            # 回收 EMA（compute_reward 内部会更新这两个键）
+            self._rew_ema_q = float(mg_ctx.get("ema_abs_q", self._rew_ema_q))
+            self._rew_ema_b = float(mg_ctx.get("ema_abs_b", self._rew_ema_b))
 
             # === 填 next_state / 终止 ===
             if pend.next_state is None:
@@ -284,20 +337,63 @@ class RLRunner:
                 avg_psnr = st["psnr"] / frames
                 est_budget = st.get("budget", float(pend.meta.get("mg_bits_tgt", 0.0)))
                 mg_id = int(pend.meta.get("mg_id", 0))
-                print(f"[MG] gop={gop_id} mg_id={mg_id} | "
-                      f"actual_bits_sum={actual_bits_sum:.0f} | "
-                      f"est_budget(mg_bits_tgt)={est_budget:.0f} | "
-                      f"avg_psnr={avg_psnr:.2f} dB")
+                # print(f"[MG] gop={gop_id} mg_id={mg_id} | "
+                #       f"actual_bits_sum={actual_bits_sum:.0f} | "
+                #       f"est_budget(mg_bits_tgt)={est_budget:.0f} | "
+                #       f"avg_psnr={avg_psnr:.2f} dB")
 
                 # 用完清除，避免累积
                 self.mg_stats.pop(key, None)
 
                 self.last_doc_in_mg = None
-                # 清除过旧 pending，防泄漏
-                ks = sorted(list(self.pending.keys()))
-                for k in ks[:-2]:
-                    self.pending.pop(k, None)
+                # 仅清理“非常旧”的 pending：保留最近 K 个，并给宽限时间
+                keep_latest = int(getattr(self.cfg, "pending_keep_latest", 64))
+                grace_ms = int(getattr(self.cfg, "pending_grace_ms", 3000))  # 3秒
+                now = now_ms()
+                ks = sorted(self.pending.keys())
+                for k in ks[:-keep_latest]:
+                    p = self.pending.get(k)
+                    if p and (now - getattr(p, "created_at_ms", now)) > grace_ms:
+                        self.pending.pop(k, None)
 
             try_remove(fb_path)
             anyp = True
         return anyp
+
+    def _write_epoch_metrics(self, epoch_id: int):
+        """把上一轮 epoch 的平均 lossa/lossc 以及帧平均 bits/PSNR 落到 CSV。"""
+        try:
+            mean_a = (self._ep_loss_sum_a / max(1, self._ep_updates))
+            mean_c = (self._ep_loss_sum_c / max(1, self._ep_updates))
+            avg_bpf = (self._ep_bits_sum / max(1, self._ep_frames))     # bits per frame
+            avg_psnr = (self._ep_psnr_sum / max(1, self._ep_frames))    # dB
+
+            # 如需 kbps，可在 config 里提供 fps
+            fps = float(getattr(self.cfg, "fps", 0.0))
+            avg_kbps = (avg_bpf * fps / 1000.0) if fps > 0 else ""
+
+            row = {
+                "epoch": epoch_id,
+                "updates": self._ep_updates,
+                "lossa_mean": f"{mean_a:.6f}",
+                "lossc_mean": f"{mean_c:.6f}",
+                "frames": self._ep_frames,
+                "avg_bits_per_frame": f"{avg_bpf:.2f}",
+                "avg_psnr_db": f"{avg_psnr:.3f}",
+                "avg_kbps": f"{avg_kbps:.2f}" if avg_kbps != "" else "",
+                "timestamp": int(time.time()),
+            }
+
+            file_exists = os.path.exists(self._metrics_csv)
+            with open(self._metrics_csv, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if not file_exists and not self._metrics_csv_inited:
+                    w.writeheader()
+                    self._metrics_csv_inited = True
+                w.writerow(row)
+            print(f"[RL][CSV] epoch={epoch_id} avg_lossa={row['lossa_mean']} avg_lossc={row['lossc_mean']} "
+                  f"| frames={self._ep_frames} avg_bpf={row['avg_bits_per_frame']} avg_psnr={row['avg_psnr_db']}"
+                  + (f" avg_kbps={row['avg_kbps']}" if avg_kbps != "" else ""))
+        except Exception as e:
+            print(f"[warn] failed to write metrics csv: {e}")
+

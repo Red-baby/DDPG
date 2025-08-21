@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"D:\Python\DDPG\rl_io"
+    rl_dir: str = r"E:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -18,6 +18,7 @@ class Config:
     # QP 边界（固定常数，不再放入状态）
     qp_min: int = 80
     qp_max: int = 200
+    fps: int = 30
 
     # === Algorithm ===
     algo: str = "td3"  # "ddpg" or "td3"
@@ -126,7 +127,7 @@ class Config:
     # 帧级码率项
     pf_tol = 0.20  # 单帧容忍 ±20%
     pf_huber_delta = 0.20
-    w_bf = 0.6
+    w_bf = 0.3
 
     # mini-GOP 级码率项
     mg_tol = 0.05  # mini-GOP 容忍 ±5%
@@ -137,6 +138,9 @@ class Config:
     reward_balance_auto = True
     reward_balance_momentum = 0.95
     reward_balance_target_mag = 0.8  # 期望两路项的平均幅度
+
+    # === Logging ===
+    metrics_csv: str = "epoch_losses.csv"  # 记录每个 epoch 的平均 lossa/lossc
 
     # 其他
     w_q = 1.0
