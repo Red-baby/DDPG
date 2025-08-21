@@ -42,7 +42,7 @@ class ActorNet(nn.Module):
     cond_idx：从 state 中抽取的条件字段索引，默认选取与当前帧/上一帧关联的部分。
     """
     def __init__(self, state_dim: int, hidden: int = 512, depth: int = 4,
-                 cond_idx: tuple[int, ...] = (6, 7, 9, 10, 11)):
+                 cond_idx: tuple[int, ...] = (0, 1, 6, 8, 10)):
         super().__init__()
         self.fc_in = nn.Linear(state_dim, hidden)
         self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=0.1) for _ in range(depth)])

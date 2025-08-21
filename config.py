@@ -148,6 +148,9 @@ class Config:
     reward_clip = 1.5
     reward_scale = 1.0
 
+    # lookahead_cost 的量级缩放（把几十万缩到~1，再 log1p）
+    lookahead_scale: float = 1e5  # 你的实际量级如果不是 1e5，自行改这个
+
     # mini-GOP 级：累计超出分梯度惩罚（每帧都生效）
     w_mg_over: float = 0.8  # 常规累计超出惩罚（分梯度）
     mg_over_hard_ratio: float = 2.0  # 累计严重超出阈值（如 ≥2×）
