@@ -185,14 +185,19 @@ class TD3:
         self.actor.eval()
         a01 = self.actor(s.unsqueeze(0).to(self.device)).cpu().item()
         if explore:
+            # 2) 仅在训练时加入探索噪声与epsilon随机
             a01 += np.random.randn() * float(getattr(self.cfg, "expl_noise_std", 0.15))
-        a01 = float(np.clip(a01, 0.0, 1.0))
-        # 仍保留少量 epsilon 随机
-        if explore and np.random.rand() < float(getattr(self.cfg, "action_eps_train", 0.10)):
-            a01 = np.random.rand()
+            if np.random.rand() < float(getattr(self.cfg, "action_eps_train", 0.10)):
+                a01 = np.random.rand()
+        else:
+            # 验证/推理：强制确定性（不要任何随机项）
+            pass
 
+            # 3) 裁剪并离散到 QP
+        a01 = float(np.clip(a01, 0.0, 1.0))
         qp = self.cfg.qp_min + a01 * (self.cfg.qp_max - self.cfg.qp_min)
-        return int(np.clip(round(qp), self.cfg.qp_min, self.cfg.qp_max))
+        qp = int(np.clip(round(qp), self.cfg.qp_min, self.cfg.qp_max))
+        return qp
 
     def _soft_update(self, src, tgt, tau):
         with torch.no_grad():
@@ -259,9 +264,9 @@ class TD3:
 
 
     # ====== 保存/加载（与 DDPG 签名一致，供 main/RLRunner 调用） ======
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, extra: dict = None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
+        ckpt = {
             "algo": "td3",
             "actor": self.actor.state_dict(),
             "actor_tgt": self.actor_tgt.state_dict(),
@@ -274,7 +279,10 @@ class TD3:
             "env_steps": getattr(self, "total_env_steps", 0),
             "train_steps": getattr(self, "total_train_steps", 0),
             "cfg": getattr(self.cfg, "__dict__", None),
-        }, path)
+        }
+        if extra:
+            ckpt.update(extra)
+        torch.save(ckpt, path)
 
     def load_checkpoint(self, path: str, map_location=None):
         ckpt = torch.load(path, map_location=map_location or self.device)

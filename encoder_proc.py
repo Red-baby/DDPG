@@ -14,13 +14,11 @@ def _win_no_window_flags(cfg):
     flags = {}
     if getattr(cfg, "hide_encoder_console_window", False):
         flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        # 兼容某些平台（如老 Python）：
-        try:
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            flags["startupinfo"] = si
-        except Exception:
-            pass
+    try:
+        import msvcrt
+        flags["close_fds"] = False
+    except Exception:
+        pass
     return flags
 
 def _maybe_open_log_files(cfg):
@@ -49,13 +47,15 @@ def launch_encoder(cfg, video_args: list[str]):
 
     stdout_fd, stderr_fd = _maybe_open_log_files(cfg)
 
-    popen_kwargs = dict(env=env, stdout=stdout_fd, stderr=stderr_fd)
-    popen_kwargs.update(_win_no_window_flags(cfg))
+    popen_kwargs = dict(
+        stdout=stdout_fd,
+        stderr=stderr_fd,
+        env=env,
+        cwd=os.getcwd(),
+        **_win_no_window_flags(cfg)
+    )
 
-    if not getattr(cfg, "show_encoder_output", False) and stdout_fd is subprocess.PIPE:
-        # 如果想在控制台实时看输出，可在主进程读取；默认不需要
-        pass
-
+    # Windows 上编码器可能需要 shell=False；Linux/Mac 亦可
     enc = subprocess.Popen(cmd, **popen_kwargs)
     return enc
 

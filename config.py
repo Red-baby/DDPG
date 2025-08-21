@@ -6,7 +6,7 @@ import torch, os
 class Config:
     # 运行
     rl_dir: str = r"E:\Python\DDPG\rl_io"
-    mode: str = "train"                       # "train" | "infer"
+    mode: str = "train"                       # "train" | "infer"| "val"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

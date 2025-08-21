@@ -29,6 +29,29 @@ class RunningNorm:
     def normalize(self, x: torch.Tensor, clip: float = 10.0):
         z = (x - self.mean) / torch.sqrt(self.var + self.eps)
         return torch.clamp(z, -clip, clip)
+    def state_dict(self) -> dict:
+        # 以 torch.save 友好的形式导出
+        return {
+            "momentum": float(self.momentum),
+            "eps": float(self.eps),
+            "mean": self.mean.detach().cpu(),
+            "var":  self.var.detach().cpu(),
+        }
+
+    def load_state_dict(self, d: dict):
+        # 兼容历史 ckpt 的健壮处理
+        if "momentum" in d:
+            self.momentum = float(d["momentum"])
+        if "eps" in d:
+            self.eps = float(d["eps"])
+        if "mean" in d:
+            # 保持原 dtype/shape
+            with torch.no_grad():
+                self.mean.copy_(d["mean"].to(self.mean.dtype))
+        if "var" in d:
+            with torch.no_grad():
+                self.var.copy_(d["var"].to(self.var.dtype))
+
 
 class StateBuilder:
     def __init__(self, cfg):
@@ -106,7 +129,8 @@ class StateBuilder:
             "prev_rel_err": float(prev_rel_err),         #10
         }
         vec  = torch.tensor([s[k] for k in STATE_FIELDS], dtype=torch.float32)
-        self.norm.update(vec)
+        if str(getattr(self.cfg, "mode", "train")) == "train":
+            self.norm.update(vec)
         nvec = self.norm.normalize(vec, clip=self.cfg.feature_clip)
 
         # 更新用于下一帧的参照
@@ -131,3 +155,5 @@ class StateBuilder:
         self.prev_bits = float(bits)
         self.prev_psnr = float(psnr)
         self.prev_qp   = float(qp)
+
+
