@@ -135,3 +135,53 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
     r = s_q * (w_q * q_term) + s_b * (w_bf * b_frame + w_bmg * b_mg)
     r = max(-clip_mag, min(clip_mag, r))
     return float(r * scale)
+
+
+def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
+    """Return (rD, rR) for the dual-critic setting.
+    - rD: per-frame quality reward (PSNR-monotonic, normalized to ~(-1,1)).
+    - rR: GOP/mini-GOP terminal rate reward (0 at non-terminal steps; negative absolute deviation at terminal).
+    This mirrors Sec. 2.3 (r_D immediate; r_R only at terminal) in the dual-critic paper.
+    """
+    # Observations
+    psnr_y = _float(fb.get("psnr_y", 0.0))
+    pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
+    psnr_mode = str(getattr(cfg, "psnr_mode", "y")).lower()
+    if psnr_mode == "yuv" and psnr_y > 0 and pu > 0 and pv > 0:
+        psnr = (6*psnr_y + pu + pv) / 8.0
+    else:
+        psnr = psnr_y
+
+    # Distortion reward: monotonic in PSNR, tanh-shaped (scaled by q_span around q_mid)
+    q_mid = float(getattr(cfg, "q_mid_db", 38.0))
+    q_span = float(getattr(cfg, "q_span_db", 2.0))
+    rD = float(math.tanh((psnr - q_mid) / max(1e-6, q_span)))
+
+    # Rate reward: only at terminal of mini-GOP/GOP
+    mg_bits_tgt = _float(rq_meta.get("mg_bits_tgt", 0.0))
+    fac = float(getattr(cfg, "rR_target_factor", 1.0))
+    mg_bits_tgt_eff = mg_bits_tgt * fac
+    mg_bits_rem = _float(rq_meta.get("mg_bits_rem", 0.0))
+    bits = _float(fb.get("bits", 0.0))
+    # frames_left_mg can be 0 at terminal (some encoders emit 0 or 1; we accept both conventions)
+    flm_val = fb.get("frames_left_mg", rq_meta.get("frames_left_mg", None))
+    terminal = (flm_val is not None) and (int(flm_val) == 0)
+
+    # —— mini-GOP 末帧的码率误差项（dual: rR）
+    if terminal and mg_bits_tgt > 0.0:
+        # 1) 优先使用 RL 端传入的“上一帧为止的真实累计”
+        hint = rq_meta.get("mg_used_before", None)
+        if hint is not None:
+            used_before = float(hint)
+        else:
+            # 2) 回退用 (tgt - rem)，注意不要 clamp；允许 rem 为负表示已超
+            used_before = (mg_bits_tgt - mg_bits_rem)
+
+        used_after = used_before + bits  # 整个 mini-GOP 实际总用比特
+        # 若你启用了 rR_target_factor（放宽/收紧目标），这里先得到有效目标
+        tgt_eff = mg_bits_tgt * float(getattr(cfg, "rR_target_factor", 1.0))
+        rR = - abs(used_after - tgt_eff) / max(1.0, tgt_eff)
+    else:
+        rR = 0.0
+
+    return float(rD), float(rR)

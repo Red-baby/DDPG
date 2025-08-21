@@ -18,16 +18,16 @@ def parse_args():
     ap.add_argument("--rl-dir", type=str, default=Config.rl_dir)
     # 仍然在 main 中输入编码器命令行：每个元素内部用“|”分隔
     ap.add_argument("--videos", type=str, nargs="+", default=[
-        "--input|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.yuv|"
+        "--input|D:/Python/DDPG/park_mobile_1920x1080_24.yuv|"
         "--input-res|1920x1080|"
         "--frames|0|"
-        "--o|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.ivf|"
-        "--csv|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24_821.csv|"
+        "--o|D:/Python/DDPG/park_mobile_1920x1080_24.ivf|"
+        "--csv|D:/Python/DDPG/park_mobile_1920x1080_24_822.csv|"
         "--bitrate|2125|"
         "--rc-mode|1|"
         "--pass|2|"
-        "--stat-in|E:/Git/qav1_ori/qav1/workspace/1pass.log|"
-        "--stat-out|E:/Git/qav1_ori/qav1/workspace/2pass.log|"
+        "--stat-in|D:/Python/DDPG/1pass.log|"
+        "--stat-out|D:/Python/DDPG/2pass.log|"
         "--score-max|50.5|"
         "--score-avg|40.5|"
         "--score-min|38.5|"
@@ -40,10 +40,10 @@ def parse_args():
         "--bitrate|2125"
     ])
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--start-epoch", type=int, default=5, help="当前(起始)epoch编号，用于继续训练的显示与命名")
+    ap.add_argument("--start-epoch", type=int, default=0, help="当前(起始)epoch编号，用于继续训练的显示与命名")
     ap.add_argument("--mode", type=str, default="train", choices=["train", "val", "infer"])
-    ap.add_argument("--encoder", type=str, default=r"E:\Git\qav1_ori\qav1\build\vs2022\x64\Release\qav1enc.exe")
-    ap.add_argument("--resume", type=str, default=r"E:\python\DDPG\checkpoints\ckpt_e0005.pth", help="可选：指向 ckpt 文件或目录；从该 checkpoint 继续训练/验证")
+    ap.add_argument("--encoder", type=str, default=r"D:/Python/DDPG/qav1enc.exe")
+    ap.add_argument("--resume", type=str, default=r"", help="可选：指向 ckpt 文件或目录；从该 checkpoint 继续训练/验证")
     ap.add_argument("--ckpt-prefix", type=str, default="ckpt", help="保存检查点的前缀名")
     return ap.parse_args()
 

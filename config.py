@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"E:\Python\DDPG\rl_io"
+    rl_dir: str = r"D:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"| "val"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,8 +21,9 @@ class Config:
     fps: int = 30
 
     # === Algorithm ===
-    algo: str = "td3"  # "ddpg" or "td3"
-
+    algo: str = "dual"  # "ddpg" or "td3"
+    over_budget_factor: float = 1.2  # 超预算判定阈值因子（预算×因子）
+    rR_target_factor:  float = 1.2   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
     # Exploration (online action noise)
     expl_noise_std: float = 0.15  # 给 select_action 的高斯噪声（取代 OU）
 
@@ -132,7 +133,7 @@ class Config:
     # mini-GOP 级码率项
     mg_tol = 0.05  # mini-GOP 容忍 ±5%
     mg_huber_delta = 0.05
-    w_bmg = 1.0
+    w_bmg = 2.5
 
     # 自适应平衡
     reward_balance_auto = True
@@ -140,7 +141,7 @@ class Config:
     reward_balance_target_mag = 0.8  # 期望两路项的平均幅度
 
     # === Logging ===
-    metrics_csv: str = "epoch_losses.csv"  # 记录每个 epoch 的平均 lossa/lossc
+    metrics_csv: str = "epoch_losses_822.csv"  # 记录每个 epoch 的平均 lossa/lossc
 
     # 其他
     w_q = 1.0
