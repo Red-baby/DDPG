@@ -22,8 +22,8 @@ class Config:
 
     # === Algorithm ===
     algo: str = "dual"  # "ddpg" or "td3"
-    over_budget_factor: float = 1.2  # 超预算判定阈值因子（预算×因子）
-    rR_target_factor:  float = 1.2   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
+    over_budget_factor: float = 1.0  # 超预算判定阈值因子（预算×因子）
+    rR_target_factor:  float = 1.0   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
     # Exploration (online action noise)
     expl_noise_std: float = 0.15  # 给 select_action 的高斯噪声（取代 OU）
 

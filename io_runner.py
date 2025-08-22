@@ -205,7 +205,14 @@ class RLRunner:
 
             # ==== 选动作，写回 qp ====
             explore = (self.cfg.mode == "train")
-            qp = self.agent.select_action(s, explore=explore)
+            # 若 mini-GOP 剩余预算已为 0（或接近 0），直接强制最大 QP
+            mg_rem = _float(rq.get("mg_bits_rem", 0.0))
+            if mg_rem <= 0.0:
+                qp = self.cfg.qp_max
+                meta["forced_max_qp"] = True
+            else:
+                qp = self.agent.select_action(s, explore=explore)
+                meta["forced_max_qp"] = False
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
             try_remove(rq_path)
@@ -222,10 +229,11 @@ class RLRunner:
 
             # Dual-critic: 收集无噪声 rollout 的状态，用于 mini-GOP 终止时更新 actor
             if str(getattr(self.cfg, 'algo', '')).lower() in ('dual', 'dual_ddpg', 'dual_td3'):
-                try:
-                    self.agent.rollout_collect_state(s)
-                except Exception:
-                    pass
+                if not bool(meta.get("forced_max_qp", False)):
+                    try:
+                        self.agent.rollout_collect_state(s)
+                    except Exception:
+                        pass
 
             # 为上一帧补 next_state
             if self.last_doc_in_mg is not None and self.last_doc_in_mg in self.pending:
