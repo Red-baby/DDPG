@@ -273,8 +273,8 @@ class RLRunner:
             self._ep_frames += 1
 
             gop_id = int(pend.meta.get("gop_id", 0))
-            mg_idx = int(pend.meta.get("mg_index", 0))
-            key = (gop_id, mg_idx)
+            mg_id = int(pend.meta.get("mg_id", 0))
+            key = (gop_id, mg_id)
             st = self.mg_stats.get(key)
             if st is None:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0, "budget": float(pend.meta.get("mg_bits_tgt", 0.0))}

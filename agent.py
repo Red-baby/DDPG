@@ -491,7 +491,7 @@ class DualCriticDDPG:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.opt_a.step()
         self.last_loss_a = float(loss_a.item())
-        return which, self.last_loss_a
+=       return which, self.last_loss_a
 
     def save_checkpoint(self, path: str, extra: dict | None = None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
