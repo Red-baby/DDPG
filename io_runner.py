@@ -79,6 +79,8 @@ class RLRunner:
         self._metrics_csv_inited = False
         self.loss_ema_a = None
         self.loss_ema_c = None
+        # 等待区：同一个 (gop_id, mg_id) 始终只暂存上一帧
+        self._wait_last_dual = {}
 
     def set_epoch(self, idx: int, total: int):
         # 写上一个 epoch 的指标（如果有）
@@ -304,17 +306,38 @@ class RLRunner:
                 algo = str(getattr(self.cfg, 'algo', '')).lower()
                 if algo in ('dual', 'dual_ddpg', 'dual_td3'):
                     rD, rR = compute_reward_dual(self.cfg, fb, rq_meta=meta2)
-                    if pend.next_state is None:
-                        pend.next_state = pend.state.clone() if not done else torch.zeros_like(pend.state)
-                    # push into dual buffer
-                    self.agent.bufC.push(
-                        pend.state.numpy(),
-                        np.array([[pend.action_a01]], dtype=np.float32),
-                        np.array([[rD]], dtype=np.float32),
-                        np.array([[rR]], dtype=np.float32),
-                        pend.next_state.numpy(),
-                        np.array([[1.0 if done else 0.0]], dtype=np.float32)
-                    )
+                    prev_pack = self._wait_last_dual.pop(key, None)
+                    if prev_pack is not None:
+                        prev = prev_pack["pend"]  # 上一帧 Pending
+                        if prev.next_state is None:
+                            prev.next_state = pend.state  # s_{n-1} 的 next_state = s_n
+                        self.agent.bufC.push(
+                            prev.state.numpy(),
+                            np.array([[prev.action_a01]], dtype=np.float32),
+                            np.array([[prev_pack["rD"]]], dtype=np.float32),
+                            np.array([[prev_pack["rR"]]], dtype=np.float32),
+                            prev.next_state.numpy(),
+                            np.array([[0.0]], dtype=np.float32)  # 上一帧必然不是终止帧
+                        )
+
+                    # ---- 处理当前帧 n：非终止就缓存，终止就立即推（next_state = 0）----
+                    if not done:
+                        # 只缓存，不 push；等第 n+1 帧来时用它的 state 当 next_state 再推
+                        self._wait_last_dual[key] = dict(pend=pend, rD=rD, rR=rR, done=False)
+                    else:
+                        # 终止帧（episode 尾）：自己立刻用 absorber 推
+                        if pend.next_state is None:
+                            pend.next_state = torch.zeros_like(pend.state)
+                        self.agent.bufC.push(
+                            pend.state.numpy(),
+                            np.array([[pend.action_a01]], dtype=np.float32),
+                            np.array([[rD]], dtype=np.float32),
+                            np.array([[rR]], dtype=np.float32),
+                            pend.next_state.numpy(),
+                            np.array([[1.0]], dtype=np.float32)
+                        )
+                        # 保险：终止后清空等待（同 mg 的缓存不应再保留）
+                        self._wait_last_dual.pop(key, None)
                 else:
                     mg_ctx = {"frames_so_far": int(max(1, st["frames"])), "ema_abs_q": float(self._rew_ema_q),
                               "ema_abs_b": float(self._rew_ema_b)}
