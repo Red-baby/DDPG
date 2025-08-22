@@ -412,7 +412,7 @@ class DualCriticDDPG:
         self.last_loss_a = None
 
     @torch.no_grad()
-    def select_action(self, s: torch.Tensor, explore: bool) -> int:
+    def select_action(self, s: torch.Tensor, base_qp: int, explore: bool) -> int:
         self.actor.eval()
         a01 = self.actor(s.unsqueeze(0).to(self.device)).cpu().item()
         if explore:
@@ -420,8 +420,21 @@ class DualCriticDDPG:
             if np.random.rand() < float(getattr(self.cfg, "action_eps_train", 0.10)):
                 a01 = np.random.rand()
         a01 = float(np.clip(a01, 0.0, 1.0))
-        qp  = self.cfg.qp_min + a01 * (self.cfg.qp_max - self.cfg.qp_min)
-        qp  = int(np.clip(round(qp), self.cfg.qp_min, self.cfg.qp_max))
+        # === 关键：以 baseQP 为中心、±窗口的直接映射 ===
+        # 可在 config 里放一个开关；若没有配置，则默认 20
+        W = int(getattr(self.cfg, "base_qp_window", 20))
+        # 也可以区分训练/推理窗口（可选）：
+        # W = int(getattr(self.cfg, "base_qp_window_train", 20) if explore
+        #         else getattr(self.cfg, "base_qp_window_eval", 20))
+
+        lo = max(self.cfg.qp_min, int(base_qp) - W)
+        hi = min(self.cfg.qp_max, int(base_qp) + W)
+
+        if hi <= lo:
+            qp = int(lo)
+        else:
+            qp = int(round(lo + a01 * (hi - lo)))
+
         return qp
 
     def rollout_collect_state(self, s):

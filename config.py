@@ -165,6 +165,9 @@ class Config:
     # main.py 会循环这些视频作为多个 epoch
     video_list: list[str] = None
 
+    # 以 baseQP 为中心的动作映射窗口半径
+    base_qp_window: int = 20
+
     def __post_init__(self):
         if self.video_list is None:
             self.video_list = ["./videos/seq1.y4m"]

@@ -213,7 +213,8 @@ class RLRunner:
                 qp = self.cfg.qp_max
                 meta["forced_max_qp"] = True
             else:
-                qp = self.agent.select_action(s, explore=explore)
+                base_qp = int(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max) // 2))
+                qp = self.agent.select_action(s, base_qp=base_qp, explore=explore)
                 meta["forced_max_qp"] = False
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
