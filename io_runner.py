@@ -208,20 +208,21 @@ class RLRunner:
             # ==== 选动作，写回 qp ====
             explore = (self.cfg.mode == "train")
             # 若 mini-GOP 剩余预算已为 0（或接近 0），直接强制最大 QP
-            mg_rem = _float(rq.get("mg_bits_rem", 0.0))
-            if mg_rem <= 0.0:
-                qp = self.cfg.qp_max
-                meta["forced_max_qp"] = True
-            else:
-                base_qp = int(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max) // 2))
-                qp = self.agent.select_action(s, base_qp=base_qp, explore=explore)
-                meta["forced_max_qp"] = False
+            # mg_rem = _float(rq.get("mg_bits_rem", 0.0))
+            # if mg_rem <= 0.0:
+            #     qp = self.cfg.qp_max
+            #     meta["forced_max_qp"] = True
+            # else:
+            #     qp = self.agent.select_action(s, explore=explore)
+            #     meta["forced_max_qp"] = False
+            qp = self.agent.select_action(s, meta["base_q"],explore=explore)
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
             try_remove(rq_path)
 
-            denom = max(1, (self.cfg.qp_max - self.cfg.qp_min))
-            a01 = float((qp - self.cfg.qp_min) / denom)
+            delta_max = float(getattr(self.cfg, "delta_qp_max", 4))
+            a01 = 0.5 + (float(qp) - float(meta["base_q"])) / (2.0 * delta_max)
+            a01 = float(np.clip(a01, 0.0, 1.0))
 
             doc = _int(meta.get("doc", -1))
 
@@ -232,11 +233,15 @@ class RLRunner:
 
             # Dual-critic: 收集无噪声 rollout 的状态，用于 mini-GOP 终止时更新 actor
             if str(getattr(self.cfg, 'algo', '')).lower() in ('dual', 'dual_ddpg', 'dual_td3'):
-                if not bool(meta.get("forced_max_qp", False)):
-                    try:
-                        self.agent.rollout_collect_state(s)
-                    except Exception:
-                        pass
+                # if not bool(meta.get("forced_max_qp", False)):
+                #     try:
+                #         self.agent.rollout_collect_state(s)
+                #     except Exception:
+                #         pass
+                try:
+                    self.agent. rollout_collect_state(s)
+                except Exception:
+                    pass
 
             # 为上一帧补 next_state
             if self.last_doc_in_mg is not None and self.last_doc_in_mg in self.pending:
@@ -290,13 +295,15 @@ class RLRunner:
             if st is None:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0, "budget": float(pend.meta.get("mg_bits_tgt", 0.0))}
                 self.mg_stats[key] = st
+
+            # === 把“当前帧之前的累计用比特”带给 reward，避免 rem 被夹到0失真 ===
+            used_before = float(st["bits"])  # 截止上一帧的真实累计
+            meta2 = dict(pend.meta)
+            meta2["mg_used_before"] = used_before
+
             st["bits"] += bits_obs
             st["psnr"] += psnr_obs
             st["frames"] += 1
-            # === 把“当前帧之前的累计用比特”带给 reward，避免 rem 被夹到0失真 ===
-            used_before = float(st["bits"] - bits_obs)  # 截止上一帧的真实累计
-            meta2 = dict(pend.meta)
-            meta2["mg_used_before"] = used_before
 
             # 是否 episode 终止
             flm_val = fb.get("frames_left_mg", pend.meta.get("frames_left_mg", None))

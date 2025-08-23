@@ -139,49 +139,65 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
 
 def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
     """Return (rD, rR) for the dual-critic setting.
-    - rD: per-frame quality reward (PSNR-monotonic, normalized to ~(-1,1)).
-    - rR: GOP/mini-GOP terminal rate reward (0 at non-terminal steps; negative absolute deviation at terminal).
-    This mirrors Sec. 2.3 (r_D immediate; r_R only at terminal) in the dual-critic paper.
+    - rD: 每帧失真奖励（随 PSNR 单调，tanh 形状，约在 -1..+1）
+    - rR: 码率偏差奖励：**一旦累计用比特超过目标，从当前帧开始每帧给负向 rR**；
+          否则为 0。支持“越早越重”的放大与严重超额的额外重罚。
     """
-    # Observations
+    # ----------- 失真项 rD（与原逻辑一致）-----------
     psnr_y = _float(fb.get("psnr_y", 0.0))
     pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
     psnr_mode = str(getattr(cfg, "psnr_mode", "y")).lower()
     if psnr_mode == "yuv" and psnr_y > 0 and pu > 0 and pv > 0:
-        psnr = (6*psnr_y + pu + pv) / 8.0
+        psnr = (6 * psnr_y + pu + pv) / 8.0
     else:
         psnr = psnr_y
 
-    # Distortion reward: monotonic in PSNR, tanh-shaped (scaled by q_span around q_mid)
     q_mid = float(getattr(cfg, "q_mid_db", 38.0))
     q_span = float(getattr(cfg, "q_span_db", 2.0))
     rD = float(math.tanh((psnr - q_mid) / max(1e-6, q_span)))
 
-    # Rate reward: only at terminal of mini-GOP/GOP
+    # ----------- 码率项 rR：一旦超额即逐帧惩罚 -----------
     mg_bits_tgt = _float(rq_meta.get("mg_bits_tgt", 0.0))
-    fac = float(getattr(cfg, "rR_target_factor", 1.0))
-    mg_bits_tgt_eff = mg_bits_tgt * fac
     mg_bits_rem = _float(rq_meta.get("mg_bits_rem", 0.0))
-    bits = _float(fb.get("bits", 0.0))
-    # frames_left_mg can be 0 at terminal (some encoders emit 0 or 1; we accept both conventions)
-    flm_val = fb.get("frames_left_mg", rq_meta.get("frames_left_mg", None))
-    terminal = (flm_val is not None) and (int(flm_val) == 0)
+    bits        = _float(fb.get("bits", 0.0))
+    tgt_eff     = mg_bits_tgt * float(getattr(cfg, "rR_target_factor", 1.0))
 
-    # —— mini-GOP 末帧的码率误差项（dual: rR）
-    if terminal and mg_bits_tgt > 0.0:
-        # 1) 优先使用 RL 端传入的“上一帧为止的真实累计”
-        hint = rq_meta.get("mg_used_before", None)
-        if hint is not None:
-            used_before = float(hint)
-        else:
-            # 2) 回退用 (tgt - rem)，注意不要 clamp；允许 rem 为负表示已超
-            used_before = (mg_bits_tgt - mg_bits_rem)
-
-        used_after = used_before + bits  # 整个 mini-GOP 实际总用比特
-        # 若你启用了 rR_target_factor（放宽/收紧目标），这里先得到有效目标
-        tgt_eff = mg_bits_tgt * float(getattr(cfg, "rR_target_factor", 1.0))
-        rR = - abs(used_after - tgt_eff) / max(1.0, tgt_eff)
+    # 进度 progress∈[0,1]：越早超（progress 小），惩罚放大越多
+    if mg_bits_tgt > 0.0:
+        progress = (mg_bits_tgt - mg_bits_rem) / mg_bits_tgt
+        progress = max(0.0, min(1.0, float(progress)))
     else:
+        progress = 1.0
+
+    # 累计用比特（上一帧止）优先用 RL 端真实累计，避免 rem 被夹到0造成偏差
+    hint = rq_meta.get("mg_used_before", None)
+    if hint is not None:
+        used_before = float(hint)
+    else:
+        used_before = (mg_bits_tgt - mg_bits_rem)
+    used_after = used_before + bits
+
+    if mg_bits_tgt > 0.0 and tgt_eff > 0.0 and used_after > tgt_eff:
+        # 已超：从当前帧起每帧给 rR<0
+        over_frac = (used_after - tgt_eff) / max(1.0, tgt_eff)
+
+        # 早超放大：progress 越小（越早），放大因子越大
+        amp_base = float(getattr(cfg, "mg_early_amp", 1.0))   # 如 1.0
+        amp_exp  = float(getattr(cfg, "mg_early_exp", 0.9))   # 如 0.9
+        early_amp = 1.0 + amp_base * ((1.0 - progress) ** amp_exp)
+
+        w_over = float(getattr(cfg, "w_mg_over", 0.8))        # 常规累计超额惩罚
+        rR = - w_over * over_frac * early_amp
+
+        # 严重超额（如 ≥ 2×）额外重罚
+        hard_ratio = float(getattr(cfg, "mg_over_hard_ratio", 2.0))
+        if used_after >= hard_ratio * tgt_eff:
+            w_hard = float(getattr(cfg, "w_mg_over_hard", 3.5))
+            extra = (used_after - hard_ratio * tgt_eff) / max(1.0, tgt_eff)
+            rR += - w_hard * max(0.0, extra)
+    else:
+        # 未超：码率项不惩罚（由 rD 或你其它项主导）
         rR = 0.0
 
     return float(rD), float(rR)
+

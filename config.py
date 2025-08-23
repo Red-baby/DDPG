@@ -22,8 +22,8 @@ class Config:
 
     # === Algorithm ===
     algo: str = "dual"  # "ddpg" or "td3"
-    over_budget_factor: float = 1.0  # 超预算判定阈值因子（预算×因子）
-    rR_target_factor:  float = 1.0   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
+    over_budget_factor: float = 0.95  # 超预算判定阈值因子（预算×因子）
+    rR_target_factor:  float = 0.95   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
     # Exploration (online action noise)
     expl_noise_std: float = 0.15  # 给 select_action 的高斯噪声（取代 OU）
 
@@ -123,7 +123,7 @@ class Config:
 
     # 失真项映射
     q_mid_db = 38.0  # PSNR 中位（数据集大致水平）
-    q_span_db = 2.0  # 每 2dB 作为 1 个尺度 -> tanh(-1..1)
+    q_span_db = 1.0  # 每 2dB 作为 1 个尺度 -> tanh(-1..1)
 
     # 帧级码率项
     pf_tol = 0.20  # 单帧容忍 ±20%
@@ -141,7 +141,7 @@ class Config:
     reward_balance_target_mag = 0.8  # 期望两路项的平均幅度
 
     # === Logging ===
-    metrics_csv: str = "epoch_losses_822.csv"  # 记录每个 epoch 的平均 lossa/lossc
+    metrics_csv: str = "epoch_losses_823.csv"  # 记录每个 epoch 的平均 lossa/lossc
 
     # 其他
     w_q = 1.0
@@ -153,8 +153,8 @@ class Config:
     lookahead_scale: float = 1e5  # 你的实际量级如果不是 1e5，自行改这个
 
     # mini-GOP 级：累计超出分梯度惩罚（每帧都生效）
-    w_mg_over: float = 0.8  # 常规累计超出惩罚（分梯度）
-    mg_over_hard_ratio: float = 2.0  # 累计严重超出阈值（如 ≥2×）
+    w_mg_over: float = 1.5  # 常规累计超出惩罚（分梯度）
+    mg_over_hard_ratio: float = 1.2  # 累计严重超出阈值（如 ≥2×）
     w_mg_over_hard: float = 3.5  # 累计严重超出额外惩罚
     # q_gain 分段形状（幅度可按需调）
     q_between_neg: float = 0.30  #  在 psnr=psnr_min 时，q_gain 约为 -q_between_neg（“略靠近0的负”）
