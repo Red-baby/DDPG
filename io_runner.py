@@ -379,20 +379,20 @@ class RLRunner:
                 est_budget = st.get("budget", float(pend.meta.get("mg_bits_tgt", 0.0)))
                 # 可打印 mini-GOP 汇总（按需开启）
                 # print(f"[MG] gop={gop_id} mg={mg_idx} budget={est_budget:.0f} used={actual_bits_sum:.0f} avgPSNR={avg_psnr:.2f}")
-
-                algo = str(getattr(self.cfg, 'algo', '')).lower()
-                if algo in ('dual', 'dual_ddpg', 'dual_td3'):
- # gate: treat "over budget" as actual_bits > (estimated_budget * over_budget_factor)
-                    fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
-                    thr = est_budget * fac if est_budget > 0 else est_budget
-                    over_budget = bool(actual_bits_sum > thr)
-                    try:
-                        which, loss_a = self.agent.finish_rollout_and_update_actor(over_budget)
-                        if loss_a is not None:
-                            self._ep_loss_sum_a += float(loss_a)
-                            self._ep_updates += 1
-                    except Exception as e:
-                        print(f"[RL][WARN] dual-critic actor update failed: {e}")
+                if self.cfg.mode == "train":
+                    algo = str(getattr(self.cfg, 'algo', '')).lower()
+                    if algo in ('dual', 'dual_ddpg', 'dual_td3'):
+     # gate: treat "over budget" as actual_bits > (estimated_budget * over_budget_factor)
+                        fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
+                        thr = est_budget * fac if est_budget > 0 else est_budget
+                        over_budget = bool(actual_bits_sum > thr)
+                        try:
+                            which, loss_a = self.agent.finish_rollout_and_update_actor(over_budget)
+                            if loss_a is not None:
+                                self._ep_loss_sum_a += float(loss_a)
+                                self._ep_updates += 1
+                        except Exception as e:
+                            print(f"[RL][WARN] dual-critic actor update failed: {e}")
                 self.mg_stats.pop(key, None)
                 self.last_doc_in_mg = None
 
