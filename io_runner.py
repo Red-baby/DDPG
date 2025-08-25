@@ -277,7 +277,7 @@ class RLRunner:
             # 观测
             psnr_y = _float(fb.get("psnr_y", 0.0))
             if getattr(self.cfg, "psnr_mode", "y") == "yuv":
-                pu = _float(fb.get("psnr_u", 0.0));
+                pu = _float(fb.get("psnr_u", 0.0))
                 pv = _float(fb.get("psnr_v", 0.0))
                 psnr_obs = (6 * psnr_y + pu + pv) / 8.0 if (psnr_y > 0 and pu > 0 and pv > 0) else psnr_y
             else:
@@ -296,11 +296,18 @@ class RLRunner:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0, "budget": float(pend.meta.get("mg_bits_tgt", 0.0))}
                 self.mg_stats[key] = st
 
-            # === 把“当前帧之前的累计用比特”带给 reward，避免 rem 被夹到0失真 ===
+            # === 把“当前帧之前的累计用比特/平均PSNR”带给 reward  ===
             used_before = float(st["bits"])  # 截止上一帧的真实累计
             meta2 = dict(pend.meta)
             meta2["mg_used_before"] = used_before
+            # 平均 PSNR（仅统计到上一帧；首帧用 -1.0 表示“未知”，避免误触发放宽）
+            if st["frames"] > 0:
+                avg_psnr_so_far = st["psnr"] / float(st["frames"])
+            else:
+                avg_psnr_so_far = -1.0
+            meta2["mg_avg_psnr_so_far"] = float(avg_psnr_so_far)
 
+            # 累计到“当前帧后”再更新统计
             st["bits"] += bits_obs
             st["psnr"] += psnr_obs
             st["frames"] += 1
@@ -378,14 +385,20 @@ class RLRunner:
                 avg_psnr = st["psnr"] / frames
                 est_budget = st.get("budget", float(pend.meta.get("mg_bits_tgt", 0.0)))
                 # 可打印 mini-GOP 汇总（按需开启）
-                # print(f"[MG] gop={gop_id} mg={mg_idx} budget={est_budget:.0f} used={actual_bits_sum:.0f} avgPSNR={avg_psnr:.2f}")
+                # print(f"[MG] gop={gop_id} mg={mg_id} budget={est_budget:.0f} used={actual_bits_sum:.0f} avgPSNR={avg_psnr:.2f}")
                 if self.cfg.mode == "train":
                     algo = str(getattr(self.cfg, 'algo', '')).lower()
                     if algo in ('dual', 'dual_ddpg', 'dual_td3'):
-     # gate: treat "over budget" as actual_bits > (estimated_budget * over_budget_factor)
-                        fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
+                        # gate: 若平均PSNR未达标，放宽阈值到 bit_relax_max_factor×预算；否则用常规 over_budget_factor
+                        avg_target = float(getattr(self.cfg, "avg_psnr_target_db",
+                                                   getattr(self.cfg, "psnr_target_db", 0.0)))
+                        relax_fac = float(getattr(self.cfg, "bit_relax_max_factor", 1.5))
+                        strict_fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
+                        fac = (relax_fac if avg_psnr < avg_target else strict_fac)
                         thr = est_budget * fac if est_budget > 0 else est_budget
-                        over_budget = bool(actual_bits_sum > thr)
+                        over_bits = bool(actual_bits_sum > thr)
+                        # 关键：PSNR 达标即偏向省码 → 直接用 rate critic
+                        over_budget = (avg_psnr >= avg_target) or over_bits
                         try:
                             which, loss_a = self.agent.finish_rollout_and_update_actor(over_budget)
                             if loss_a is not None:

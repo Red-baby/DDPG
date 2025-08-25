@@ -5,7 +5,7 @@ import torch, os
 @dataclass
 class Config:
     # 运行
-    rl_dir: str = r"D:\Python\DDPG\rl_io"
+    rl_dir: str = r"E:\Python\DDPG\rl_io"
     mode: str = "train"                       # "train" | "infer"| "val"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,11 +77,15 @@ class Config:
     psnr_mode: str = "y"  # "y" | "yuv"
 
     # 当 PSNR 达标时更重视省比特；未达标时弱化比特惩罚
-    psnr_target_db: float = 42.5   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
+    psnr_target_db: float = 40.5   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
     psnr_min_db: float = 40.0
     bit_gate_hi: float = 1.0       # psnr >= target：比特权重倍率
     bit_gate_lo: float = 0.25      # psnr <  target：比特权重倍率
 
+    avg_psnr_target_db: float = 40.5
+    # 低于目标时，允许的“有效预算”放宽因子（比如 1.5 = 允许到 1.5× 目标码率）
+    bit_relax_max_factor: float = 1.5
+    w_rate_satisfied: float = 0.6  # 达标后“省码更优”的力度：rR = -w * bits / mg_bits_tgt
     # mini-GOP 早超惩罚：越早越重
     mg_early_amp: float = 1.0  # 放大量，1.0 表示最高可再乘 2 倍（=1+1）
     mg_early_exp: float = 0.9  # 曲线指数；>1 更偏向最早几帧，<1 更平滑

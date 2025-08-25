@@ -140,8 +140,10 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
 def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
     """Return (rD, rR) for the dual-critic setting.
     - rD: 每帧失真奖励（随 PSNR 单调，tanh 形状，约在 -1..+1）
-    - rR: 码率偏差奖励：**一旦累计用比特超过目标，从当前帧开始每帧给负向 rR**；
-          否则为 0。支持“越早越重”的放大与严重超额的额外重罚。
+    - rR: 码率项。
+          * 若“到上一帧”为止的平均PSNR 已达标：直接鼓励省码（比特越少越好）
+          * 若未达标：允许预算放宽（如 1.5×），一旦累计超额，从当前帧起每帧给负向 rR，
+            支持“越早越重”的放大与严重超额的额外重罚。
     """
     # ----------- 失真项 rD（与原逻辑一致）-----------
     psnr_y = _float(fb.get("psnr_y", 0.0))
@@ -156,11 +158,19 @@ def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
     q_span = float(getattr(cfg, "q_span_db", 2.0))
     rD = float(math.tanh((psnr - q_mid) / max(1e-6, q_span)))
 
-    # ----------- 码率项 rR：一旦超额即逐帧惩罚 -----------
+    # ----------- 码率项 rR：达标→省码；未达标→放宽阈值再惩罚 -----------
     mg_bits_tgt = _float(rq_meta.get("mg_bits_tgt", 0.0))
     mg_bits_rem = _float(rq_meta.get("mg_bits_rem", 0.0))
     bits        = _float(fb.get("bits", 0.0))
-    tgt_eff     = mg_bits_tgt * float(getattr(cfg, "rR_target_factor", 1.0))
+
+    # 平均PSNR门控（到上一帧为止）
+    avg_so_far = _float(rq_meta.get("mg_avg_psnr_so_far", -1.0))
+    avg_target = float(getattr(cfg, "avg_psnr_target_db",
+                        getattr(cfg, "psnr_target_db", 0.0)))
+    relax_fac  = float(getattr(cfg, "bit_relax_max_factor", 1.5))
+    base_fac   = float(getattr(cfg, "rR_target_factor", 1.0))
+    use_fac    = (relax_fac if (avg_so_far >= 0.0 and avg_so_far < avg_target) else base_fac)
+    tgt_eff    = mg_bits_tgt * use_fac
 
     # 进度 progress∈[0,1]：越早超（progress 小），惩罚放大越多
     if mg_bits_tgt > 0.0:
@@ -177,8 +187,13 @@ def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
         used_before = (mg_bits_tgt - mg_bits_rem)
     used_after = used_before + bits
 
-    if mg_bits_tgt > 0.0 and tgt_eff > 0.0 and used_after > tgt_eff:
-        # 已超：从当前帧起每帧给 rR<0
+    # === 达标：比特越少越好（直接对本帧 bits 给负向奖励） ===
+    if (avg_so_far >= 0.0 and avg_so_far >= avg_target and mg_bits_tgt > 0.0):
+        w_save = float(getattr(cfg, "w_rate_satisfied", 0.6))  # 可在 config 中覆盖
+        rR = - w_save * (bits / max(1.0, mg_bits_tgt))
+
+    # === 未达标：按放宽后的目标预算判定是否超额并惩罚 ===
+    elif mg_bits_tgt > 0.0 and tgt_eff > 0.0 and used_after > tgt_eff:
         over_frac = (used_after - tgt_eff) / max(1.0, tgt_eff)
 
         # 早超放大：progress 越小（越早），放大因子越大
@@ -195,8 +210,9 @@ def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
             w_hard = float(getattr(cfg, "w_mg_over_hard", 3.5))
             extra = (used_after - hard_ratio * tgt_eff) / max(1.0, tgt_eff)
             rR += - w_hard * max(0.0, extra)
+
     else:
-        # 未超：码率项不惩罚（由 rD 或你其它项主导）
+        # 未超且未达标：不惩罚（把码率弹性留给“达标前提”的提质）
         rR = 0.0
 
     return float(rD), float(rR)
