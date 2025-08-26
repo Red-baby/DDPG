@@ -39,13 +39,28 @@ def parse_args():
                     help="保存检查点的前缀名")
 
     # 方式一：与原来一致，手工传多条 --videos（每条内部用“|”分隔参数）
-    ap.add_argument(
-        "--videos",
-        type=str,
-        nargs="+",
-        default=[],  # 若不使用数据集模式，则需要显式给 --videos
-        help="每条是一段完整的编码器 2-pass 命令（内部用 | 分隔），每个 epoch 依次取一条运行",
-    )
+    ap.add_argument("--videos", type=str, nargs="+", default=[
+        "--input|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.yuv|"
+        "--input-res|1920x1080|"
+        "--frames|0|"
+        "--o|E:/Git/qav1_ori/qav1/workspace//park_mobile_1920x1080_24.ivf|"
+        "--csv|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24_822.csv|"
+        "--bitrate|2125|"
+        "--rc-mode|1|"
+        "--pass|2|"
+        "--stat-in|E:/Git/qav1_ori/qav1/workspace/1pass.log|"
+        "--stat-out|E:/Git/qav1_ori/qav1/workspace/2pass.log|"
+        "--score-max|50.5|"
+        "--score-avg|40.5|"
+        "--score-min|38.5|"
+        "--fps|30|"
+        "--preset|0|"
+        "--keyint|225|"
+        "--bframes|15|"
+        "--threads|1|"
+        "--parallel-frames|1|"
+        "--bitrate|2125"
+    ])
 
     # 方式二：数据集模式（新增，参数由 dataset.py 注入）
     ds.add_dataset_args(ap)

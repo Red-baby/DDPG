@@ -89,7 +89,7 @@ class Config:
     # mini-GOP 早超惩罚：越早越重
     mg_early_amp: float = 1.0  # 放大量，1.0 表示最高可再乘 2 倍（=1+1）
     mg_early_exp: float = 0.9  # 曲线指数；>1 更偏向最早几帧，<1 更平滑
-
+    delta_qp_max: float = 10.0
     # 当 PSNR 未达标时，平滑项的缩放系数（0 = 直接关闭；0.25 = 只保留 25%）
     w_smooth_under_scale: float = 0.25
 
@@ -158,7 +158,7 @@ class Config:
 
     # mini-GOP 级：累计超出分梯度惩罚（每帧都生效）
     w_mg_over: float = 1.5  # 常规累计超出惩罚（分梯度）
-    mg_over_hard_ratio: float = 1.2  # 累计严重超出阈值（如 ≥2×）
+    mg_over_hard_ratio: float = 1.8  # 累计严重超出阈值（如 ≥2×）
     w_mg_over_hard: float = 3.5  # 累计严重超出额外惩罚
     # q_gain 分段形状（幅度可按需调）
     q_between_neg: float = 0.30  #  在 psnr=psnr_min 时，q_gain 约为 -q_between_neg（“略靠近0的负”）
