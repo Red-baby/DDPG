@@ -126,7 +126,7 @@ def main():
     # 构造“每个 epoch 一条命令”的列表
     video_cmds: List[List[str]] = []
 
-    if args.dataset_inputs:
+    if 0:#args.dataset_inputs:
         # 数据集模式：自动从 --dataset-* 生成 2-pass 命令（含 --stat-in / --csv / --stat-out / --o）
         video_cmds = ds.build_cmds_from_dataset(args, cfg)
     else:

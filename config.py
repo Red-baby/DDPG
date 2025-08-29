@@ -38,7 +38,7 @@ class Config:
     tau:   float = 0.005
     actor_lr:  float = 1e-4
     critic_lr: float = 2e-4
-    batch_size: int = 4
+    batch_size: int = 16
     replay_size: int = 10000
     warmup_steps: int = 1000
     train_steps_per_env_step: int = 4
@@ -74,7 +74,7 @@ class Config:
     use_gop_credit: bool = False  # <<< 宏：关闭后不使用 gop_credit
 
     # 观测：采用 PSNR（"y" 或 "yuv"）
-    psnr_mode: str = "y"  # "y" | "yuv"
+    psnr_mode: str = "yuv"  # "y" | "yuv"
 
     # 当 PSNR 达标时更重视省比特；未达标时弱化比特惩罚
     psnr_target_db: float = 40.5   # 若 rq 里有 score_avg/score_min，会优先用 rq 的
@@ -89,7 +89,7 @@ class Config:
     # mini-GOP 早超惩罚：越早越重
     mg_early_amp: float = 1.0  # 放大量，1.0 表示最高可再乘 2 倍（=1+1）
     mg_early_exp: float = 0.9  # 曲线指数；>1 更偏向最早几帧，<1 更平滑
-    delta_qp_max: float = 10.0
+    delta_qp_max: float = 20.0
     # 当 PSNR 未达标时，平滑项的缩放系数（0 = 直接关闭；0.25 = 只保留 25%）
     w_smooth_under_scale: float = 0.25
 

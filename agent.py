@@ -4,6 +4,15 @@ import torch.nn as nn
 import os
 from dataclasses import dataclass
 from models import ActorNet, CriticNet
+from state import STATE_FIELDS
+
+def _cond_idx_from_names(names):
+    idx = []
+    for n in names:
+        if n in STATE_FIELDS:
+            idx.append(STATE_FIELDS.index(n))
+    return tuple(idx)
+
 
 
 class ReplayBuffer:
@@ -56,8 +65,14 @@ class DDPG:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
 
-        self.actor = ActorNet(state_dim).to(self.device)
-        self.actor_tgt = ActorNet(state_dim).to(self.device)
+        self.actor = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
+        self.actor_tgt = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
         self.actor_tgt.load_state_dict(self.actor.state_dict())
 
         self.critic = CriticNet(state_dim).to(self.device)
@@ -78,21 +93,24 @@ class DDPG:
         self.last_loss_a = None
 
     @torch.no_grad()
-    def select_action(self, s: torch.Tensor, explore: bool) -> int:
-        # s: [D]; 输出离散 QP（用 cfg.qp_min/max 映射）
+    def select_action(self, s: torch.Tensor, base_q: int, explore: bool) -> int:
+        # s: [D]; 输出为相对 ΔQP 的 a01 → 锚到 base_q 上的实际 QP
         self.actor.eval()
         a01 = self.actor(s.unsqueeze(0).to(self.device)).cpu().item()
         if explore:
             a01 += self.noise.sample()
-            a01 = float(np.clip(a01, 0.0, 1.0))
             if np.random.rand() < self.cfg.action_eps_train:
                 a01 = np.random.rand()
         else:
             if self.cfg.action_eps_infer > 0 and np.random.rand() < self.cfg.action_eps_infer:
                 a01 = np.random.rand()
-
-        qp = self.cfg.qp_min + a01 * (self.cfg.qp_max - self.cfg.qp_min)
-        return int(np.clip(round(qp), self.cfg.qp_min, self.cfg.qp_max))
+        a01 = float(np.clip(a01, 0.0, 1.0))
+        delta_max = float(getattr(self.cfg, "delta_qp_max", 10))
+        delta = (a01 - 0.5) * 2.0 * delta_max
+        mix = float(getattr(self.cfg, "mix_with_baseline", 0.0))
+        qp_exec = (1.0 - mix) * (float(base_q) + delta) + mix * float(base_q)
+        qp = int(np.clip(round(qp_exec), self.cfg.qp_min, self.cfg.qp_max))
+        return qp
 
     def train_step(self):
         if len(self.buf) < max(self.cfg.batch_size, self.cfg.warmup_steps):
@@ -178,8 +196,14 @@ class TD3:
         self.device = torch.device(cfg.device)
 
         # actor + targets
-        self.actor = ActorNet(state_dim).to(self.device)
-        self.actor_tgt = ActorNet(state_dim).to(self.device)
+        self.actor = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
+        self.actor_tgt = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
         self.actor_tgt.load_state_dict(self.actor.state_dict())
 
         # twin critics + targets
@@ -203,22 +227,21 @@ class TD3:
         self.last_loss_a = None
 
     @torch.no_grad()
-    def select_action(self, s: torch.Tensor, explore: bool) -> int:
+    def select_action(self, s: torch.Tensor, base_q: int, explore: bool) -> int:
         self.actor.eval()
         a01 = self.actor(s.unsqueeze(0).to(self.device)).cpu().item()
         if explore:
-            # 2) 仅在训练时加入探索噪声与epsilon随机
+            # 训练时加入探索噪声与epsilon随机
             a01 += np.random.randn() * float(getattr(self.cfg, "expl_noise_std", 0.15))
             if np.random.rand() < float(getattr(self.cfg, "action_eps_train", 0.10)):
                 a01 = np.random.rand()
-        else:
-            # 验证/推理：强制确定性（不要任何随机项）
-            pass
-
-            # 3) 裁剪并离散到 QP
+        # 裁剪 a01 并映射到 ΔQP，再锚到 base_q
         a01 = float(np.clip(a01, 0.0, 1.0))
-        qp = self.cfg.qp_min + a01 * (self.cfg.qp_max - self.cfg.qp_min)
-        qp = int(np.clip(round(qp), self.cfg.qp_min, self.cfg.qp_max))
+        delta_max = float(getattr(self.cfg, "delta_qp_max", 10))
+        delta = (a01 - 0.5) * 2.0 * delta_max
+        mix = float(getattr(self.cfg, "mix_with_baseline", 0.0))
+        qp_exec = (1.0 - mix) * (float(base_q) + delta) + mix * float(base_q)
+        qp = int(np.clip(round(qp_exec), self.cfg.qp_min, self.cfg.qp_max))
         return qp
 
     def _soft_update(self, src, tgt, tau):
@@ -387,8 +410,14 @@ class DualCriticDDPG:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
 
-        self.actor = ActorNet(state_dim).to(self.device)
-        self.actor_tgt = ActorNet(state_dim).to(self.device)
+        self.actor = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
+        self.actor_tgt = ActorNet(state_dim, cond_idx=_cond_idx_from_names((
+        "mg_progress", "frames_left_mg",
+        "prev_qp_delta", "prev_psnr_err", "prev_rel_err"
+    ))).to(self.device)
         self.actor_tgt.load_state_dict(self.actor.state_dict())
 
         self.critic_d = CriticNet(state_dim).to(self.device)

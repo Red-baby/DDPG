@@ -48,7 +48,8 @@ class ActorNet(nn.Module):
         self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=0.1) for _ in range(depth)])
         self.ln = nn.LayerNorm(hidden)
         self.cond_idx = cond_idx
-        self.film = FilmGate(len(cond_idx), hidden, hidden)
+        z_dim = (len(cond_idx) if cond_idx is not None else state_dim)
+        self.film = FilmGate(z_dim, hidden, hidden)
         self.fc_out = nn.Linear(hidden, 1)
 
     def forward(self, s):

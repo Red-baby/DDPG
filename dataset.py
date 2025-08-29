@@ -203,7 +203,7 @@ def build_cmds_from_dataset(args, cfg) -> List[List[str]]:
             brs = str(br).replace(".", "_")
 
             # 1-pass 日志路径：{seq}_{enc}_pass1_{br}.log（位于 stat-dir）
-            stat_in = os.path.join(args.stat_dir, f"{seq}_ori_pass1_{brs}.log")
+            stat_in = os.path.join(args.stat_dir, f"{seq}_qav1enc_pass1_{brs}.log")
 
             # 2-pass 输出路径（位于 out-dir）
             stat_out = os.path.join(args.out_dir, f"{name_base}_pass2_{brs}.log")
