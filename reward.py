@@ -199,7 +199,7 @@ def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
         # 早超放大：progress 越小（越早），放大因子越大
         amp_base = float(getattr(cfg, "mg_early_amp", 1.0))   # 如 1.0
         amp_exp  = float(getattr(cfg, "mg_early_exp", 0.9))   # 如 0.9
-        early_amp = 1.0 + amp_base * ((1.0 - progress) ** amp_exp)
+        early_amp = 1.0 + amp_base * pow(progress, amp_exp)  # progress 越大 → early_amp 越大
 
         w_over = float(getattr(cfg, "w_mg_over", 0.8))        # 常规累计超额惩罚
         rR = - w_over * over_frac * early_amp
