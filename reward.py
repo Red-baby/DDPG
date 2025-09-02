@@ -2,6 +2,17 @@
 import math
 from utils import _float, _int
 
+
+# --- 新增：由 threshold_frame_bits 计算 mini-GOP 总上限 ---
+def _mg_cap_total_from_threshold_meta(rq_meta: dict) -> float:
+    # 目标每帧上限（bit/帧）
+    thr_fb = _float(rq_meta.get("threshold_frame_bits", 0.0))
+    if thr_fb <= 0.0:
+        return 0.0
+    # mini-GOP 总帧数
+    mg_size = _int(rq_meta.get("mg_size", 0)+1)
+    return float(thr_fb) * float(max(0, mg_size))
+
 def _huber_abs(x: float, delta: float) -> float:
     ax = abs(float(x)); d = float(max(1e-9, delta))
     return (0.5 * (ax*ax) / d) if ax <= d else (ax - 0.5 * d)
@@ -170,8 +181,9 @@ def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
     relax_fac  = float(getattr(cfg, "bit_relax_max_factor", 1.5))
     base_fac   = float(getattr(cfg, "rR_target_factor", 1.0))
     use_fac    = (relax_fac if (avg_so_far >= 0.0 and avg_so_far < avg_target) else base_fac)
-    tgt_eff    = mg_bits_tgt * use_fac
-
+    # === 新逻辑：按 threshold_frame_bits 计算 mini-GOP 总上限，并应用放宽因子 ===
+    mg_cap_total = _mg_cap_total_from_threshold_meta(rq_meta)  # 目标口径的 mini-GOP 总上限（bit）
+    tgt_eff = mg_cap_total * use_fac
     # 进度 progress∈[0,1]：越早超（progress 小），惩罚放大越多
     if mg_bits_tgt > 0.0:
         progress = (mg_bits_tgt - mg_bits_rem) / mg_bits_tgt

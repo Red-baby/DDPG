@@ -22,6 +22,7 @@ STATE_FIELDS = [
     "log_mg_bits_tgt", "log_mg_bits_rem",
     "mg_progress", "frames_left_mg",
     "prev_qp_delta", "prev_psnr_err", "prev_rel_err",
+    'log_thr_fb',
 ]
 
 @dataclass
@@ -151,6 +152,10 @@ class StateBuilder:
             psnr_pred_cur = _float(rq.get("psnr_pred", rq.get("psnr_est", rq.get("psnr_pred_cur", 0.0))))
             self.prev_psnr_pred = float(psnr_pred_cur)
 
+            # 在“原始量”读取附近，算一个对数特征（防数量级爆炸）
+            thr_fb = _float(rq.get("threshold_frame_bits", 0.0))  # 你已在 RQ 写入的上限每帧比特（bit/帧）
+            log_thr_fb = math.log1p(max(0.0, thr_fb))
+
             # === 组装向量 ===
             s = {
                 "tid_0": float(tid_onehot[0]),
@@ -168,6 +173,7 @@ class StateBuilder:
                 "prev_qp_delta": float(prev_qp_delta),
                 "prev_psnr_err": float(prev_psnr_err),
                 "prev_rel_err": float(prev_rel_err),
+                "log_thr_fb": float(log_thr_fb),
             }
             vec  = torch.tensor([s[k] for k in STATE_FIELDS], dtype=torch.float32)
             if str(getattr(self.cfg, "mode", "train")) == "train":
@@ -186,11 +192,13 @@ class StateBuilder:
                 "doc": _int(rq.get("doc", -1)),
                 "mg_id": _int(rq.get("mg_id", 0)),
                 "mg_index": _int(rq.get("mg_index", 0)),
+                "mg_size": _int(rq.get("mg_size", 0)),
                 "frames_left_mg": _int(rq.get("frames_left_mg", 0)),
                 "base_q": int(base_q),
                 "bits_pred_frame": float(pred_pf),
                 "mg_bits_tgt": float(mg_tgt),
                 "mg_bits_rem": float(mg_rem),
+                "threshold_frame_bits": float(rq.get("threshold_frame_bits", 0.0)),
             }
             return nvec, meta
 
