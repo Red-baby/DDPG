@@ -274,7 +274,7 @@ class RLRunner:
 
             pend = self.pending[doc]
 
-            # 观测
+            # ---- 观测 ----
             psnr_y = _float(fb.get("psnr_y", 0.0))
             if getattr(self.cfg, "psnr_mode", "y") == "yuv":
                 pu = _float(fb.get("psnr_u", 0.0))
@@ -296,11 +296,10 @@ class RLRunner:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0, "budget": float(pend.meta.get("mg_bits_tgt", 0.0))}
                 self.mg_stats[key] = st
 
-            # === 把“当前帧之前的累计用比特/平均PSNR”带给 reward  ===
-            used_before = float(st["bits"])  # 截止上一帧的真实累计
+            # === 把“当前帧之前的累计用比特/平均PSNR”带给 reward ===
+            used_before = float(st["bits"])  # 截止上一帧
             meta2 = dict(pend.meta)
             meta2["mg_used_before"] = used_before
-            # 平均 PSNR（仅统计到上一帧；首帧用 -1.0 表示“未知”，避免误触发放宽）
             if st["frames"] > 0:
                 avg_psnr_so_far = st["psnr"] / float(st["frames"])
             else:
@@ -316,14 +315,18 @@ class RLRunner:
             flm_val = fb.get("frames_left_mg", pend.meta.get("frames_left_mg", None))
             done = (flm_val is not None) and (int(flm_val) == 0)
 
-            # === 推入回放 + 训练（仅训练模式） ===
+            # === 训练路径 ===
             if self.cfg.mode == "train":
                 algo = str(getattr(self.cfg, 'algo', '')).lower()
+
                 if algo in ('dual', 'dual_ddpg', 'dual_td3'):
+                    # 计算奖励（dual：失真/码率两路）
                     rD, rR = compute_reward_dual(self.cfg, fb, rq_meta=meta2)
+
+                    # 回放拼接（上一帧在这一步补齐 next_state）
                     prev_pack = self._wait_last_dual.pop(key, None)
                     if prev_pack is not None:
-                        prev = prev_pack["pend"]  # 上一帧 Pending
+                        prev = prev_pack["pend"]
                         if prev.next_state is None:
                             prev.next_state = pend.state  # s_{n-1} 的 next_state = s_n
                         self.agent.bufC.push(
@@ -332,15 +335,40 @@ class RLRunner:
                             np.array([[prev_pack["rD"]]], dtype=np.float32),
                             np.array([[prev_pack["rR"]]], dtype=np.float32),
                             prev.next_state.numpy(),
-                            np.array([[0.0]], dtype=np.float32)  # 上一帧必然不是终止帧
+                            np.array([[0.0]], dtype=np.float32)
                         )
 
-                    # ---- 处理当前帧 n：非终止就缓存，终止就立即推（next_state = 0）----
+                    # ---- 每帧门控更新 actor（关键）----
+                    try:
+                        # 用“目标每帧上限 * mg_size”优先作为 mini-GOP 总上限；否则退回 mg_bits_tgt
+                        thr_fb = float(pend.meta.get("threshold_frame_bits", 0.0))
+                        mg_size = int(pend.meta.get("mg_size", 0))
+                        if thr_fb > 0.0 and mg_size > 0:
+                            mg_cap_total = thr_fb * float(mg_size)
+                        else:
+                            mg_cap_total = float(st.get("budget", pend.meta.get("mg_bits_tgt", 0.0)))
+
+                        over_fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
+                        thr_total = mg_cap_total * over_fac if mg_cap_total > 0.0 else 0.0
+
+                        used_after = float(st["bits"])  # 已含当前帧
+                        avg_target = float(getattr(self.cfg, "avg_psnr_target_db",
+                                                   getattr(self.cfg, "psnr_target_db", 0.0)))
+
+                        over_by_bits = (thr_total > 0.0) and (used_after > thr_total)
+                        over_budget = ((avg_psnr_so_far >= 0.0) and (avg_psnr_so_far >= avg_target)) or over_by_bits
+
+                        which, loss_a = self.agent.finish_rollout_and_update_actor(over_budget)
+                        if loss_a is not None:
+                            self._ep_loss_sum_a += float(loss_a)
+                            self._ep_updates += 1
+                    except Exception as e:
+                        print(f"[RL][WARN] dual-critic actor per-step update failed: {e}")
+
+                    # ---- 当前帧：非终止就缓存，终止就立即推（absorber）----
                     if not done:
-                        # 只缓存，不 push；等第 n+1 帧来时用它的 state 当 next_state 再推
                         self._wait_last_dual[key] = dict(pend=pend, rD=rD, rR=rR, done=False)
                     else:
-                        # 终止帧（episode 尾）：自己立刻用 absorber 推
                         if pend.next_state is None:
                             pend.next_state = torch.zeros_like(pend.state)
                         self.agent.bufC.push(
@@ -351,10 +379,22 @@ class RLRunner:
                             pend.next_state.numpy(),
                             np.array([[1.0]], dtype=np.float32)
                         )
-                        # 保险：终止后清空等待（同 mg 的缓存不应再保留）
+                        # 终止时是否再做一次 actor 更新：由配置决定（默认不再重复）
+                        if bool(getattr(self.cfg, "actor_update_on_terminal", False)):
+                            try:
+                                # 以终局门控再更新一次（可选）
+                                final_avg = st["psnr"] / max(1.0, float(st["frames"]))
+                                final_over_bits = (thr_total > 0.0) and (used_after > thr_total)
+                                final_over_budget = (final_avg >= avg_target) or final_over_bits
+                                self.agent.finish_rollout_and_update_actor(final_over_budget)
+                            except Exception as e:
+                                print(f"[RL][WARN] terminal actor update failed: {e}")
                         self._wait_last_dual.pop(key, None)
+
                 else:
-                    mg_ctx = {"frames_so_far": int(max(1, st["frames"])), "ema_abs_q": float(self._rew_ema_q),
+                    # 单 critic 情况：保持原有回放与奖励逻辑（不赘述）
+                    mg_ctx = {"frames_so_far": int(max(1, st["frames"])),
+                              "ema_abs_q": float(self._rew_ema_q),
                               "ema_abs_b": float(self._rew_ema_b)}
                     r = compute_reward(self.cfg, fb, rq_meta=pend.meta,
                                        prev_psnr_cached=float(self.sb.prev_psnr),
@@ -373,39 +413,14 @@ class RLRunner:
                         np.array([[1.0 if done else 0.0]], dtype=np.float32)
                     )
             else:
-                # 验证/推理模式：不入回放、不训练
+                # 验证/推理模式：不训练
                 pass
 
-            # 更新上一帧缓存
+            # 更新上一帧缓存（供下帧构造 prev_psnr/prev_bits 等）
             self.sb.update_prev_meas(bits=float(bits_obs), psnr=float(psnr_obs), qp=int(pend.qp_used))
 
+            # mini-GOP 结束时清理统计
             if done:
-                frames = max(1, st["frames"])
-                actual_bits_sum = st["bits"]
-                avg_psnr = st["psnr"] / frames
-                est_budget = st.get("budget", float(pend.meta.get("mg_bits_tgt", 0.0)))
-                # 可打印 mini-GOP 汇总（按需开启）
-                # print(f"[MG] gop={gop_id} mg={mg_id} budget={est_budget:.0f} used={actual_bits_sum:.0f} avgPSNR={avg_psnr:.2f}")
-                if self.cfg.mode == "train":
-                    algo = str(getattr(self.cfg, 'algo', '')).lower()
-                    if algo in ('dual', 'dual_ddpg', 'dual_td3'):
-                        # gate: 若平均PSNR未达标，放宽阈值到 bit_relax_max_factor×预算；否则用常规 over_budget_factor
-                        avg_target = float(getattr(self.cfg, "avg_psnr_target_db",
-                                                   getattr(self.cfg, "psnr_target_db", 0.0)))
-                        relax_fac = float(getattr(self.cfg, "bit_relax_max_factor", 1.5))
-                        strict_fac = float(getattr(self.cfg, "over_budget_factor", 1.0))
-                        fac = (relax_fac if avg_psnr < avg_target else strict_fac)
-                        thr = est_budget * fac if est_budget > 0 else est_budget
-                        over_bits = bool(actual_bits_sum > thr)
-                        # 关键：PSNR 达标即偏向省码 → 直接用 rate critic
-                        over_budget = (avg_psnr >= avg_target) or over_bits
-                        try:
-                            which, loss_a = self.agent.finish_rollout_and_update_actor(over_budget)
-                            if loss_a is not None:
-                                self._ep_loss_sum_a += float(loss_a)
-                                self._ep_updates += 1
-                        except Exception as e:
-                            print(f"[RL][WARN] dual-critic actor update failed: {e}")
                 self.mg_stats.pop(key, None)
                 self.last_doc_in_mg = None
 
