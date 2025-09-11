@@ -20,7 +20,6 @@ from agent import DDPG, TD3, DualCriticDDPG
 from reward import compute_reward, compute_reward_dual
 
 # ========= 新增：跨 miniGOP 记忆（全局PSNR EMA等）=========
-# 新增：跨 miniGOP 记忆（很小的工具类）
 class _CrossMGCtx:
     def __init__(self, psnr_beta=0.98):
         self.gema = 0.0
@@ -223,7 +222,8 @@ class RLRunner:
 
             # 在构建 state 之前，注入跨 miniGOP 上下文（gEMA/mg_idx/has_sc）
             rq_enriched, mg_ctx_cross = self.mgctx.on_new_request(rq)
-            state = state_builder.build(rq_enriched)
+            # 修正：用 self.sb，并接收 (state, meta)
+            s, meta = self.sb.build(rq_enriched)
 
             # GOP 变化检测（只影响统计）
             flg = _int(rq.get("frames_left_gop", -1))
@@ -258,15 +258,7 @@ class RLRunner:
 
             # ==== 选动作，写回 qp ====
             explore = (self.cfg.mode == "train")
-            # 若 mini-GOP 剩余预算已为 0（或接近 0），直接强制最大 QP
-            # mg_rem = _float(rq.get("mg_bits_rem", 0.0))
-            # if mg_rem <= 0.0:
-            #     qp = self.cfg.qp_max
-            #     meta["forced_max_qp"] = True
-            # else:
-            #     qp = self.agent.select_action(s, explore=explore)
-            #     meta["forced_max_qp"] = False
-            qp = self.agent.select_action(s, meta["base_q"],explore=explore)
+            qp = self.agent.select_action(s, meta["base_q"], explore=explore)
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             safe_write_text(qp_path, f"{qp}\n")
             try_remove(rq_path)
@@ -284,13 +276,8 @@ class RLRunner:
 
             # Dual-critic: 收集无噪声 rollout 的状态，用于 mini-GOP 终止时更新 actor
             if str(getattr(self.cfg, 'algo', '')).lower() in ('dual', 'dual_ddpg', 'dual_td3'):
-                # if not bool(meta.get("forced_max_qp", False)):
-                #     try:
-                #         self.agent.rollout_collect_state(s)
-                #     except Exception:
-                #         pass
                 try:
-                    self.agent. rollout_collect_state(s)
+                    self.agent.rollout_collect_state(s)
                 except Exception:
                     pass
 
@@ -443,17 +430,17 @@ class RLRunner:
                         self._wait_last_dual.pop(key, None)
 
                 else:
-                    # 现在改为（合并跨 mg 上下文）：
+                    # 合并跨 mg 上下文：reward侧也能拿到 gEMA/mg_idx/has_sc
                     mg_ctx = {
                         "frames_so_far": int(max(1, st["frames"])),
                         "ema_abs_q": float(self._rew_ema_q),
                         "ema_abs_b": float(self._rew_ema_b),
-                        # ↓ runner 侧跨 mg 记忆（让 reward 的“跨 mg 平滑”与 state 的输入一致）
                         "global_psnr_ema": float(self.mgctx.gema) if self.mgctx.gema > 0 else 0.0,
                         "mg_frame_idx": int(self.mgctx.mg_idx),
                         "has_sc_in_mg": bool(self.mgctx.has_sc),
                     }
-                    r = compute_reward(self.cfg, fb, rq_meta=pend.meta,
+                    # 修正：把 rq_meta 改为 meta2（包含 mg_used_before / mg_avg_psnr_so_far）
+                    r = compute_reward(self.cfg, fb, rq_meta=meta2,
                                        prev_psnr_cached=float(self.sb.prev_psnr),
                                        mg_ctx=mg_ctx)
 
