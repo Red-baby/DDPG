@@ -19,6 +19,53 @@ from state import StateBuilder, STATE_FIELDS
 from agent import DDPG, TD3, DualCriticDDPG
 from reward import compute_reward, compute_reward_dual
 
+# ========= 新增：跨 miniGOP 记忆（全局PSNR EMA等）=========
+# 新增：跨 miniGOP 记忆（很小的工具类）
+class _CrossMGCtx:
+    def __init__(self, psnr_beta=0.98):
+        self.gema = 0.0
+        self.mg_idx = 0
+        self.has_sc = False
+        self.beta = float(psnr_beta)
+
+    def on_new_request(self, rq: dict) -> tuple[dict, dict]:
+        mg_size = max(1, int(rq.get("mg_size", 16)))
+        frames_left = max(1, int(rq.get("frames_left_mg", 1)))
+        if frames_left == mg_size:  # new mg
+            self.mg_idx = 1
+            self.has_sc = False
+        else:
+            self.mg_idx = max(1, self.mg_idx + 1)
+        # lookahead 标记的 SC
+        is_sc = int(rq.get("scene_cut", rq.get("is_scene_cut", 0))) != 0
+        if is_sc:
+            self.has_sc = True
+        # enrich rq for state
+        rq2 = dict(rq)
+        rq2["global_psnr_ema"] = float(self.gema) if self.gema > 0 else 0.0
+        rq2["mg_frame_idx"] = int(self.mg_idx)
+        rq2["has_sc_in_mg"] = int(self.has_sc)
+        # mg_ctx for reward
+        mg_ctx = {
+            "global_psnr_ema": rq2["global_psnr_ema"],
+            "mg_frame_idx": rq2["mg_frame_idx"],
+            "has_sc_in_mg": bool(self.has_sc),
+        }
+        return rq2, mg_ctx
+
+    def on_feedback(self, fb: dict, rq: dict):
+        psnr = float(fb.get("psnr_y", fb.get("psnr", 0.0)) or 0.0)
+        if psnr > 0.0:
+            b = 1.0 - self.beta
+            if self.gema <= 0.0:
+                self.gema = psnr
+            else:
+                self.gema = (1.0 - b) * self.gema + b * psnr
+        # 反馈中的 SC 也并入
+        is_sc = int(rq.get("scene_cut", rq.get("is_scene_cut", 0))) != 0
+        if is_sc:
+            self.has_sc = True
+
 
 def _scan_rq_files(rl_dir: str):
     return sorted(glob.glob(os.path.join(rl_dir, "frame_*.rq.json")))
@@ -43,6 +90,8 @@ class RLRunner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.sb = StateBuilder(cfg)
+        self.mgctx = _CrossMGCtx(psnr_beta=getattr(self.cfg, "inter_global_ema_beta", 0.98))
+
         algo = str(getattr(self.cfg, "algo", "ddpg")).lower()
         if algo == "td3":
             self.agent = TD3(state_dim=len(STATE_FIELDS), cfg=cfg)
@@ -172,7 +221,9 @@ class RLRunner:
                 try_remove(rq_path)
                 continue
 
-            s, meta = self.sb.build(rq)
+            # 在构建 state 之前，注入跨 miniGOP 上下文（gEMA/mg_idx/has_sc）
+            rq_enriched, mg_ctx_cross = self.mgctx.on_new_request(rq)
+            state = state_builder.build(rq_enriched)
 
             # GOP 变化检测（只影响统计）
             flg = _int(rq.get("frames_left_gop", -1))
@@ -392,13 +443,21 @@ class RLRunner:
                         self._wait_last_dual.pop(key, None)
 
                 else:
-                    # 单 critic 情况：保持原有回放与奖励逻辑（不赘述）
-                    mg_ctx = {"frames_so_far": int(max(1, st["frames"])),
-                              "ema_abs_q": float(self._rew_ema_q),
-                              "ema_abs_b": float(self._rew_ema_b)}
+                    # 现在改为（合并跨 mg 上下文）：
+                    mg_ctx = {
+                        "frames_so_far": int(max(1, st["frames"])),
+                        "ema_abs_q": float(self._rew_ema_q),
+                        "ema_abs_b": float(self._rew_ema_b),
+                        # ↓ runner 侧跨 mg 记忆（让 reward 的“跨 mg 平滑”与 state 的输入一致）
+                        "global_psnr_ema": float(self.mgctx.gema) if self.mgctx.gema > 0 else 0.0,
+                        "mg_frame_idx": int(self.mgctx.mg_idx),
+                        "has_sc_in_mg": bool(self.mgctx.has_sc),
+                    }
                     r = compute_reward(self.cfg, fb, rq_meta=pend.meta,
                                        prev_psnr_cached=float(self.sb.prev_psnr),
                                        mg_ctx=mg_ctx)
+
+                    # 把 reward 内的自适应幅度 EMA 取回，便于下一步继续
                     self._rew_ema_q = float(mg_ctx.get("ema_abs_q", self._rew_ema_q))
                     self._rew_ema_b = float(mg_ctx.get("ema_abs_b", self._rew_ema_b))
 
@@ -418,7 +477,8 @@ class RLRunner:
 
             # 更新上一帧缓存（供下帧构造 prev_psnr/prev_bits 等）
             self.sb.update_prev_meas(bits=float(bits_obs), psnr=float(psnr_obs), qp=int(pend.qp_used))
-
+            # 在处理完本帧后，用真实反馈更新 gEMA（无论训练/推理）
+            self.mgctx.on_feedback(fb, pend.meta)
             # mini-GOP 结束时清理统计
             if done:
                 self.mg_stats.pop(key, None)

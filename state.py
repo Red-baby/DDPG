@@ -1,209 +1,117 @@
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass, field
 import math, torch
+from typing import Dict, Any, List
 from utils import _float, _int
 
-# === 状态字段（去掉 base_q；temporal_id → one-hot；prev_* 换为误差/偏差）===
-# 次序：
-# 0-5  tid_0..tid_5（共6维 one-hot，temporal_id∈[1,6] → 索引[0..5]）
-# 6    lookahead_feat
-# 5    log_pred_bits_frame
-# 6    log_mg_bits_tgt
-# 7    log_mg_bits_rem
-# 8    mg_progress
-# 9    frames_left_mg
-# 10   prev_qp_delta      （上一帧实际 QP - 上一帧 base_q）
-# 11   prev_psnr_err      （上一帧 实际PSNR - 上一帧 预估PSNR）
-# 12   prev_rel_err       （上一帧 实际bpf / 参考bpf - 1，夹[-1,1]）
-STATE_FIELDS = [
-        "tid_0", "tid_1", "tid_2", "tid_3", "tid_4", "tid_5",
-    "lookahead_feat",
-    "log_pred_bits_frame",
-    "log_mg_bits_tgt", "log_mg_bits_rem",
-    "mg_progress", "frames_left_mg",
-    "prev_qp_delta", "prev_psnr_err", "prev_rel_err",
-    'log_thr_fb',
-]
+"""
+This StateBuilder is drop-in and backward-compatible in spirit:
+- It keeps temporal_id one-hot, mg budget/progress, predicted bits, and previous
+  frame deltas.
+- It ADDS minimal cross-miniGOP smoothing context that the runner can provide
+  even at inference time (no reward needed):
+    * global_psnr_ema (from previous frames) → normalized diff to psnr_target_db
+    * mg_frame_idx (1..mg_size) → normalized to [0,1]
+    * has_sc_in_mg (0/1) and is_scene_cut (0/1)
+If the runner does not provide these keys, safe fallbacks are used (zeros).
+"""
+
+TID_MAX = 6
 
 @dataclass
-class RunningNorm:
-    momentum: float = 0.01
-    eps: float = 1e-6
-    mean: torch.Tensor = field(default_factory=lambda: torch.zeros(len(STATE_FIELDS)))
-    var:  torch.Tensor = field(default_factory=lambda: torch.ones(len(STATE_FIELDS)))
-    def update(self, x: torch.Tensor):
-        with torch.no_grad():
-            self.mean.copy_((1-self.momentum)*self.mean + self.momentum*x)
-            self.var.copy_((1-self.momentum)*self.var  + self.momentum*(x-self.mean)**2)
-    def normalize(self, x: torch.Tensor, clip: float = 10.0):
-        z = (x - self.mean) / torch.sqrt(self.var + self.eps)
-        return torch.clamp(z, -clip, clip)
-    def state_dict(self) -> dict:
-        # 以 torch.save 友好的形式导出
-        return {
-            "momentum": float(self.momentum),
-            "eps": float(self.eps),
-            "mean": self.mean.detach().cpu(),
-            "var":  self.var.detach().cpu(),
-        }
-
-    def load_state_dict(self, d: dict):
-        # 兼容历史 ckpt 的健壮处理
-        if "momentum" in d:
-            self.momentum = float(d["momentum"])
-        if "eps" in d:
-            self.eps = float(d["eps"])
-        if "mean" in d:
-            # 保持原 dtype/shape
-            with torch.no_grad():
-                self.mean.copy_(d["mean"].to(self.mean.dtype))
-        if "var" in d:
-            with torch.no_grad():
-                self.var.copy_(d["var"].to(self.var.dtype))
-
-
 class StateBuilder:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.norm = RunningNorm(momentum=cfg.norm_momentum)
-        # RL 端缓存（上一帧真实观测 & 参考 bpf）
-        self.prev_bits = 0.0
-        self.prev_psnr = 0.0
-        self.prev_qp   = float((cfg.qp_min + cfg.qp_max) / 2)
+    cfg: Any
+    # cached previous frame info for simple deltas
+    prev_qp: float = 0.0
+    prev_base_q: float = 0.0
+    prev_ref_bpf: float = 1.0
+    prev_psnr_pred: float = 0.0
+    _inited: bool = False
+
+    def reset(self):
+        self.prev_qp = 0.0
+        self.prev_base_q = 0.0
         self.prev_ref_bpf = 1.0
-        # 记录上一帧的 base_q（用于 prev_qp_delta）
-        self.prev_base_q = float((cfg.qp_min + cfg.qp_max) / 2)
-        # 可选：上一帧的 lookahead_feat（默认不用）
-        self.prev_lookahead_feat = 0.0
         self.prev_psnr_pred = 0.0
         self._inited = False
 
-    def _maybe_cold_start(self, rq: dict):
-        has_mg_idx = ("mg_index" in rq)
-        mg_idx = _int(rq.get("mg_index", -1))
-        need_reset = (not self._inited) or (has_mg_idx and mg_idx == 0)
-        if not need_reset:
+    def _maybe_cold_start(self, rq: Dict[str, Any]):
+        if self._inited:
             return
-        # 冷启动：用 mini-GOP 余量均摊出一个 bpf_t 作为初始参考，避免除0；
-        mg_bits_rem = _float(rq.get("mg_bits_rem", 0.0))
-        flm = max(1, _int(rq.get("frames_left_mg", 1)))
-        bpf_t = mg_bits_rem / flm if flm > 0 else 1.0
-        self.prev_bits = float(bpf_t)
-        self.prev_psnr = 0.0
         base_q0 = _float(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max)/2))
+        bpf_t   = _float(rq.get("bits_pred_frame", rq.get("bits_plan_frame", 1000.0)))
         self.prev_qp   = float(base_q0)
         self.prev_base_q = float(base_q0)
         self.prev_ref_bpf = max(1.0, float(bpf_t))
-        self.prev_lookahead_feat = 0.0
-        self.prev_psnr_pred = 0.0
+        self.prev_psnr_pred = float(_float(rq.get("psnr_pred", 0.0)))
         self._inited = True
 
-    def build(self, rq: dict):
-            self._maybe_cold_start(rq)
+    def build(self, rq: Dict[str, Any]) -> torch.Tensor:
+        self._maybe_cold_start(rq)
 
-            # --- 原始量 ---
-            base_q  = _float(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max)/2))
-            tid     = int(_float(rq.get("temporal_id", rq.get("update_type", 0))))
-            pred_pf = _float(rq.get("bits_plan_frame", 0.0))
-            mg_tgt  = _float(rq.get("mg_bits_tgt", 0.0))
-            mg_rem  = _float(rq.get("mg_bits_rem", 0.0))
-            flm     = _float(rq.get("frames_left_mg", 0.0))
+        # --- raw quantities ---
+        base_q  = _float(rq.get("base_q", (self.cfg.qp_min + self.cfg.qp_max)/2))
+        tid     = int(_float(rq.get("temporal_id", rq.get("update_type", 1))))
+        pred_pf = _float(rq.get("bits_pred_frame", rq.get("bits_plan_frame", self.prev_ref_bpf)))
+        mg_tgt  = _float(rq.get("mg_bits_tgt", 0.0))
+        mg_rem  = _float(rq.get("mg_bits_rem", 0.0))
+        mg_size = int(_int(rq.get("mg_size", 16)))
+        frames_left = int(_int(rq.get("frames_left_mg", 1)))
+        mg_progress = 1.0 - (frames_left / max(1.0, float(mg_size)))
+        lookahead_feat = _float(rq.get("lookahead_cost", rq.get("lookahead_feat", 0.0)))
 
-            # --- lookahead_cost 压缩到稳定量级：先缩放再 log1p ---
-            lac_raw   = _float(rq.get("lookahead_cost", 0.0))
-            lac_scale = float(getattr(self.cfg, "lookahead_scale", 1e5))  # 你的量级若是十万级，这里设 1e5
-            lookahead_feat = math.log1p(max(0.0, lac_raw / max(1e-12, lac_scale)))
+        # --- previous actuals (must be fed by runner between frames) ---
+        prev_qp = float(_float(rq.get("prev_qp", self.prev_qp)))
+        prev_base_q = float(_float(rq.get("prev_base_q", self.prev_base_q)))
+        prev_psnr_pred = float(_float(rq.get("prev_psnr_pred", self.prev_psnr_pred)))
 
-            # pred_pf 回退：无预测就用均摊
-            if pred_pf <= 0.0:
-                pred_pf = (mg_rem / max(1, int(flm))) if (mg_rem > 0 and flm > 0) else 0.0
+        # --- cross-miniGOP smoothing context (fed by runner; safe defaults) ---
+        global_psnr_ema = float(_float(rq.get("global_psnr_ema", 0.0)))  # previous EMA
+        mg_frame_idx    = int(_int(rq.get("mg_frame_idx", max(1, mg_size - frames_left + 1))))
+        has_sc_in_mg    = int(_int(rq.get("has_sc_in_mg", 0)))
+        is_scene_cut    = int(_int(rq.get("scene_cut", rq.get("is_scene_cut", 0))))
 
-            # --- 参考 bpf（用于下一帧 prev_rel_err 的“参照”）---
-            cur_ref_bpf = max(1.0, float(pred_pf))
+        # --- derived / normalization ---
+        tid_oh = [0.0]*TID_MAX
+        if 1 <= tid <= TID_MAX: tid_oh[tid-1] = 1.0
 
-            # 上一帧超/欠（相对误差，夹 [-1,1]）
-            if self.prev_ref_bpf > 0:
-                prev_rel_err = max(-1.0, min(1.0, (self.prev_bits / self.prev_ref_bpf) - 1.0))
-            else:
-                prev_rel_err = 0.0
+        log_pred_pf = math.log(max(1.0, pred_pf))
+        log_mg_tgt  = math.log(max(1.0, mg_tgt))
+        log_mg_rem  = math.log(max(1.0, mg_rem))
 
-            # 预算进度
-            mg_progress = 0.0 if mg_tgt <= 0 else max(0.0, min(1.0, (mg_tgt - mg_rem) / mg_tgt))
+        prev_qp_delta = float(prev_qp - prev_base_q)
+        # previous psnr prediction error if present
+        prev_psnr_err = float(_float(rq.get("prev_psnr", 0.0)) - prev_psnr_pred)
 
-            # log1p 压缩大数
-            log_pred_pf = math.log1p(max(0.0, pred_pf))
-            log_mg_tgt  = math.log1p(max(0.0, mg_tgt))
-            log_mg_rem  = math.log1p(max(0.0, mg_rem))
+        # normalized global EMA diff to target
+        psnr_target_db = float(getattr(self.cfg, "psnr_target_db", 40.5))
+        if global_psnr_ema > 0.0:
+            gema_diff = (global_psnr_ema - psnr_target_db) / 10.0
+        else:
+            gema_diff = 0.0
 
-            # ---- 新特征：temporal_id one-hot（6 维） ----
-            tid_onehot = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                # temporal_id ∈ [1,6] → one-hot 索引 [0..5]
-            if 1 <= tid <= 6:
-                tid_onehot[tid - 1] = 1.0
+        # mg position in [0,1]
+        mg_pos = (mg_frame_idx - 1) / max(1.0, float(mg_size - 1))
 
-            # ---- 新特征：上一帧 QP 相对偏差（相对上一帧 base_q） ----
-            prev_qp_delta = float(self.prev_qp) - float(self.prev_base_q)
+        # frame-level bit reference
+        ref_bpf = mg_rem/ max(1, frames_left) if mg_rem>0 and frames_left>0 else max(1.0, pred_pf)
+        ref_bpf = max(1.0, ref_bpf)
+        log_ref_bpf = math.log(ref_bpf)
 
-            # ---- 新特征：上一帧 PSNR 误差（实际 - 预估）----
-            # 需求变更：rq.json 提供的是“当前帧的 PSNR 预估”，这里先用缓存的上一帧预估来计算误差，
-            # 然后再把当前帧的预估缓存起来，供下一帧使用。
-            prev_psnr_err = float(self.prev_psnr) - float(self.prev_psnr_pred)
-            # 读取当前帧的 PSNR 预估并缓存
-            psnr_pred_cur = _float(rq.get("psnr_pred", rq.get("psnr_est", rq.get("psnr_pred_cur", 0.0))))
-            self.prev_psnr_pred = float(psnr_pred_cur)
+        # update caches for next call
+        self.prev_qp = base_q
+        self.prev_base_q = base_q
+        self.prev_ref_bpf = ref_bpf
+        self.prev_psnr_pred = prev_psnr_pred
 
-            # 在“原始量”读取附近，算一个对数特征（防数量级爆炸）
-            thr_fb = _float(rq.get("threshold_frame_bits", 0.0))  # 你已在 RQ 写入的上限每帧比特（bit/帧）
-            log_thr_fb = math.log1p(max(0.0, thr_fb))
+        vec: List[float] = []
+        vec += tid_oh                                      # 6
+        vec += [float(lookahead_feat)]                     # +1
+        vec += [log_pred_pf, log_mg_tgt, log_mg_rem]       # +3
+        vec += [mg_progress, float(frames_left)]           # +2
+        vec += [prev_qp_delta, prev_psnr_err]              # +2
+        vec += [log_ref_bpf]                               # +1
+        # new cross-mg smoothing features
+        vec += [gema_diff, mg_pos, float(has_sc_in_mg), float(is_scene_cut)]  # +4
 
-            # === 组装向量 ===
-            s = {
-                "tid_0": float(tid_onehot[0]),
-                "tid_1": float(tid_onehot[1]),
-                "tid_2": float(tid_onehot[2]),
-                    "tid_3": float(tid_onehot[3]),
-                    "tid_4": float(tid_onehot[4]),
-                    "tid_5": float(tid_onehot[5]),
-                "lookahead_feat": float(lookahead_feat),
-                "log_pred_bits_frame": float(log_pred_pf),
-                "log_mg_bits_tgt": float(log_mg_tgt),
-                "log_mg_bits_rem": float(log_mg_rem),
-                "mg_progress": float(mg_progress),
-                "frames_left_mg": float(flm),
-                "prev_qp_delta": float(prev_qp_delta),
-                "prev_psnr_err": float(prev_psnr_err),
-                "prev_rel_err": float(prev_rel_err),
-                "log_thr_fb": float(log_thr_fb),
-            }
-            vec  = torch.tensor([s[k] for k in STATE_FIELDS], dtype=torch.float32)
-            if str(getattr(self.cfg, "mode", "train")) == "train":
-                self.norm.update(vec)
-            nvec = self.norm.normalize(vec, clip=self.cfg.feature_clip)
-
-            # 更新用于下一帧的参照
-            self.prev_ref_bpf = cur_ref_bpf
-            # 缓存当前帧的 base_q，供下一帧计算 prev_qp_delta
-            self.prev_base_q = float(base_q)
-            # 如果你想“可选使用上一帧 lookahead”，这里缓存一下（默认不开启）
-            self.prev_lookahead_feat = lookahead_feat
-
-            # meta：只保留 reward/日志需要的键（不含 lookahead）
-            meta = {
-                "doc": _int(rq.get("doc", -1)),
-                "mg_id": _int(rq.get("mg_id", 0)),
-                "mg_index": _int(rq.get("mg_index", 0)),
-                "mg_size": _int(rq.get("mg_size", 0)),
-                "frames_left_mg": _int(rq.get("frames_left_mg", 0)),
-                "base_q": int(base_q),
-                "bits_pred_frame": float(pred_pf),
-                "mg_bits_tgt": float(mg_tgt),
-                "mg_bits_rem": float(mg_rem),
-                "threshold_frame_bits": float(rq.get("threshold_frame_bits", 0.0)),
-            }
-            return nvec, meta
-
-    def update_prev_meas(self, bits: float, psnr: float, qp: int):
-        # 供反馈阶段更新上一帧真实观测
-        self.prev_bits = float(bits)
-        self.prev_psnr = float(psnr)
-        self.prev_qp   = float(qp)
+        return torch.tensor(vec, dtype=torch.float32, device=self.cfg.device)

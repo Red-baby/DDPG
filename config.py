@@ -21,7 +21,7 @@ class Config:
     fps: int = 30
 
     # === Algorithm ===
-    algo: str = "dual"  # "ddpg" or "td3"
+    algo: str = "td3"  # "ddpg" or "td3"
     over_budget_factor: float = 0.95  # 超预算判定阈值因子（预算×因子）
     rR_target_factor:  float = 0.95   # 可选：rR 的目标也按该因子缩放（默认1.0不变）
     # Exploration (online action noise)
@@ -65,7 +65,6 @@ class Config:
     min_bpf: float = 200.0
 
     # 平滑权重略高于比特
-    w_smooth: float = 5.0
     smooth_ref_db: float = 5.0
 
     # GOP 信用项/风险项
@@ -171,6 +170,24 @@ class Config:
 
     # 以 baseQP 为中心的动作映射窗口半径
     base_qp_window: int = 20
+    # ===== 质量平滑（miniGOP 内）=====
+    smooth_ema_beta: float = 0.90  # 本mg内 PSNR 的 EMA 动量（1-β 为更新率）
+    smooth_huber_delta: float = 0.50
+    w_smooth: float = 0.35
+
+    grad_huber_delta: float = 0.70  # 相邻帧差分的 Huber
+    w_grad: float = 0.20
+    sc_grad_amp: float = 0.80  # mg 含场景切换时，差分平滑权重放大
+
+    # ===== 质量平滑（跨 miniGOP；策略/部署可见）=====
+    inter_smooth_enable: bool = True
+    inter_global_ema_beta: float = 0.98  # runner 侧全局 PSNR EMA 的动量
+    inter_smooth_huber_delta: float = 0.80
+    w_inter: float = 0.15
+    inter_smooth_first_k: int = 3  # 仅在 mg 前 K 帧对齐上一段质量水平
+    inter_gate_sc: float = 0.0  # SC mg 下的倍率：0=禁用；(0,1)=弱化
+
+    # （其余你原有的 reward/码率项参数保持不变）
 
     def __post_init__(self):
         if self.video_list is None:

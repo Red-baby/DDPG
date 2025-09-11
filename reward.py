@@ -1,231 +1,239 @@
 # -*- coding: utf-8 -*-
+"""
+Reward function with Nash-style log-utility, intra-miniGOP & inter-miniGOP quality smoothing,
+and scene-cut aware handling. Designed to work both in training (with rewards) and deployment
+(no reward) by ensuring *the policy* sees cross-miniGOP context via runner-fed mg_ctx/state
+instead of reward-internal memory only.
+
+Public API (kept stable):
+    compute_reward(cfg, fb, rq_meta, prev_psnr_cached=0.0, mg_ctx=None) -> float
+    compute_reward_dual(...)  # alias
+
+Expected keys:
+- fb: {"psnr_y" or "psnr": float, "bits": int}
+- rq_meta: {
+    "mg_bits_tgt", "mg_bits_rem", "frames_left_mg", "mg_size",
+    "bits_pred_frame" or "bits_plan_frame",
+    "scene_cut"/"is_scene_cut" (0/1),
+    "scene_mg"/"is_sc_mg" (0/1)  # optional
+}
+- mg_ctx (dict) is maintained by the runner for BOTH train & deploy:
+    {
+      "lambda": float, "lambda_init"/"lambda_lo"/"lambda_hi",
+      "global_psnr_ema": float, "mg_frame_idx": int, "has_sc_in_mg": bool
+    }
+"""
 import math
 from utils import _float, _int
 
 
-# --- 新增：由 threshold_frame_bits 计算 mini-GOP 总上限 ---
-def _mg_cap_total_from_threshold_meta(rq_meta: dict) -> float:
-    # 目标每帧上限（bit/帧）
-    thr_fb = _float(rq_meta.get("threshold_frame_bits", 0.0))
-    if thr_fb <= 0.0:
-        return 0.0
-    # mini-GOP 总帧数
-    mg_size = _int(rq_meta.get("mg_size", 0)+1)
-    return float(thr_fb) * float(max(0, mg_size))
-
+# -------------------- utilities --------------------
 def _huber_abs(x: float, delta: float) -> float:
     ax = abs(float(x)); d = float(max(1e-9, delta))
-    return (0.5 * (ax*ax) / d) if ax <= d else (ax - 0.5 * d)
+    return (0.5*(ax*ax)/d) if ax <= d else (ax - 0.5*d)
 
 def _soft_tol_penalty(rel_err: float, tol: float, delta: float) -> float:
-    """对 |相对误差| 先减容忍 tol，再做 Huber；结果≥0。"""
     over = max(0.0, abs(rel_err) - float(tol))
     return _huber_abs(over, delta)
 
+def _psnr_to_utility(psnr_db: float) -> float:
+    # stable and monotone
+    return 10.0 ** (float(psnr_db) / 20.0)
+
+def _get_bool(d: dict, *keys, default=False):
+    for k in keys:
+        if k in d:
+            try:
+                return bool(int(_int(d[k])))
+            except Exception:
+                return bool(d[k])
+    return default
+
+# -------------------- lambda update --------------------
+def _nash_update_lambda(mg_ctx: dict, eta: float, err_mg: float,
+                        lo: float, hi: float) -> None:
+    lam = float(mg_ctx.get("lambda", mg_ctx.get("lambda_init", 1e-3)))
+    lam = lam * math.exp(float(eta) * float(err_mg))   # multiplicative, keeps >0
+    lam = float(max(lo, min(hi, lam)))
+    mg_ctx["lambda"] = lam
+
+
+# -------------------- main reward --------------------
 def compute_reward(cfg, fb: dict, rq_meta: dict,
                    prev_psnr_cached: float = 0.0,
                    mg_ctx: dict | None = None) -> float:
-    """
-    r = s_q * w_q * q_term + s_b * ( w_bf * b_frame + w_bmg * b_mg )
-
-    - q_term：仅基于 PSNR 的单调奖励，使用 tanh 压到 (-1,1)
-        q_term = tanh( (psnr - q_mid_db) / q_span_db )
-
-    - b_frame：帧级码率偏差的“容忍+Huber”惩罚（≤0）
-        使用预测帧比特或 mini-GOP 的剩余均摊作为参考：
-          ref_pf = bits_pred_frame  (若提供且>0)
-                or mg_bits_rem/frames_left_mg
-                or bits_plan_frame
-                or cfg.min_bpf
-        err_pf = (bits - ref_pf) / ref_pf
-        b_frame = - SoftTolHuber(|err_pf|, tol=pf_tol, delta=pf_huber_delta)
-
-      ——“单帧有偏差是正常的”体现在 tol（如 0.20=±20%）里，tol 内不罚，超出再罚。
-         你也可以把 w_bf 设小一些，让单帧偏差更多地“交给 agent 学”。
-
-    - b_mg：mini-GOP 级的强惩罚（仅在 mini-GOP 末帧给；≤0）
-        在 frames_left_mg == 1 时，计算：
-          used_after = (mg_bits_tgt - mg_bits_rem) + bits
-          err_mg = (used_after - mg_bits_tgt) / mg_bits_tgt
-          b_mg = - SoftTolHuber(|err_mg|, tol=mg_tol, delta=mg_huber_delta)
-
-    - s_q, s_b：可选“自适应平衡系数”，用 EMA 对齐两路项的平均绝对幅度，
-      让“失真奖励”和“码率惩罚”处在同一量级，避免谁压制谁。
-      关闭它也行（见 config）。
-
-    返回值会被 clip 到 [-clip, +clip]，再乘 reward_scale。
-    """
-    # ---------- 观测 ----------
-    psnr = float(_float(fb.get("psnr_y", 0.0)))  # 也可用你之前的 6:1:1 融合
+    """Nash-like reward with quality smoothing and scene-cut-aware P boost."""
+    psnr = float(_float(fb.get("psnr_y", fb.get("psnr", 0.0))))
     bits = float(_float(fb.get("bits", 0.0)))
 
     mg_bits_tgt   = _float(rq_meta.get("mg_bits_tgt", 0.0))
     mg_bits_rem   = _float(rq_meta.get("mg_bits_rem", 0.0))
-    frames_left_mg= _int(rq_meta.get("frames_left_mg", 0))
-    plan_pf       = _float(rq_meta.get("bits_plan_frame", 0.0))
-    pred_pf       = _float(rq_meta.get("bits_pred_frame", 0.0))  # 你提供的“单帧预测比特”
+    frames_left   = max(1, _int(rq_meta.get("frames_left_mg", 1)))
+    mg_size       = max(1, _int(rq_meta.get("mg_size", frames_left)))
+    pred_pf       = _float(rq_meta.get("bits_pred_frame", rq_meta.get("bits_plan_frame", 0.0)))
 
-    # ---------- 配置 ----------
-    q_mid   = float(getattr(cfg, "q_mid_db", 38.0))   # PSNR 中位
-    q_span  = float(getattr(cfg, "q_span_db",  2.0))  # 每 2dB 变化 ~ tanh 的 1 个尺度
-    w_q     = float(getattr(cfg, "w_q",    1.0))
+    # scene flags
+    is_sc_frame   = _get_bool(rq_meta, "scene_cut", "is_scene_cut", default=False)
+    is_sc_mg_meta = _get_bool(rq_meta, "scene_mg", "is_sc_mg", default=False)
 
-    pf_tol  = float(getattr(cfg, "pf_tol", 0.20))     # 单帧容忍 ±20%
-    pf_hub  = float(getattr(cfg, "pf_huber_delta", 0.20))
-    w_bf    = float(getattr(cfg, "w_bf",   0.6))
+    # ----- per-frame normalization scale (for bit term) -----
+    if mg_bits_tgt > 0.0 and mg_size > 0:
+        pf_norm = mg_bits_tgt / float(mg_size)
+    elif pred_pf > 0.0:
+        pf_norm = pred_pf
+    else:
+        pf_norm = float(getattr(cfg, "min_bpf", 500.0))
 
-    mg_tol  = float(getattr(cfg, "mg_tol", 0.05))     # mini-GOP 容忍 ±5%
-    mg_hub  = float(getattr(cfg, "mg_huber_delta", 0.05))
-    w_bmg   = float(getattr(cfg, "w_bmg",  1.0))
+    # ----- Nash bargaining style log-utility (no per-layer bias) -----
+    # disagreement point tracked via mg_ctx or default target
+    psnr_min_db = float(getattr(cfg, "psnr_min_db", 38.0))
+    if mg_ctx is not None:
+        ud_db = float(mg_ctx.get("ud_db", psnr_min_db))
+        beta_ud = float(getattr(cfg, "ud_ema_beta", 0.9))
+        ud_db = beta_ud * ud_db + (1.0 - beta_ud) * psnr
+        mg_ctx["ud_db"] = ud_db
+    else:
+        ud_db = psnr_min_db
 
-    # 自适应平衡（让两路项同量级）
+    U  = _psnr_to_utility(psnr)
+    Ud = _psnr_to_utility(ud_db)
+    eps = float(getattr(cfg, "nash_eps", 1e-6))
+    barg = math.log(max(U - Ud, eps))
+
+    # ----- quality smoothing (intra- and inter-miniGOP) -----
+    # a) intra-mg EMA deviation
+    if mg_ctx is not None:
+        local_ema = float(mg_ctx.get("psnr_ema_mg", psnr))
+        beta_local = float(getattr(cfg, "smooth_ema_beta", 0.90))
+        local_ema = beta_local * local_ema + (1.0 - beta_local) * psnr
+        mg_ctx["psnr_ema_mg"] = local_ema
+    else:
+        local_ema = psnr
+
+    delta_smooth = float(getattr(cfg, "smooth_huber_delta", 0.50))
+    w_smooth     = float(getattr(cfg, "w_smooth", 0.35))
+    smooth_pen = - w_smooth * _huber_abs(psnr - local_ema, delta_smooth)
+
+    # b) adjacent-frame gradient with SC amplification
+    if mg_ctx is not None:
+        prev_psnr = float(mg_ctx.get("prev_psnr", psnr))
+        mg_ctx["prev_psnr"] = psnr
+        # track has_sc_in_mg and mg_frame_idx (runner should set these; fallback here)
+        start_of_mg = (frames_left == mg_size)
+        if start_of_mg:
+            mg_ctx.setdefault("has_sc_in_mg", False)
+            mg_ctx["mg_frame_idx"] = 1
+        else:
+            mg_ctx["mg_frame_idx"] = int(mg_ctx.get("mg_frame_idx", 1)) + 1
+        if is_sc_frame:
+            mg_ctx["has_sc_in_mg"] = True
+        has_sc_in_mg = bool(mg_ctx.get("has_sc_in_mg", False) or is_sc_mg_meta)
+    else:
+        prev_psnr = psnr
+        has_sc_in_mg = bool(is_sc_mg_meta or is_sc_frame)
+
+    delta_grad = float(getattr(cfg, "grad_huber_delta", 0.70))
+    w_grad     = float(getattr(cfg, "w_grad", 0.20))
+    sc_grad_amp= float(getattr(cfg, "sc_grad_amp", 0.80))
+    grad_weight= (1.0 + sc_grad_amp) if has_sc_in_mg else 1.0
+    grad_pen   = - grad_weight * w_grad * _huber_abs(psnr - prev_psnr, delta_grad)
+
+    # c) inter-mg alignment using *runner-fed* global_psnr_ema (policy sees same info)
+    inter_enable= bool(getattr(cfg, "inter_smooth_enable", True))
+    inter_pen = 0.0
+    if inter_enable:
+        # these are fed by runner at both train/infer time
+        g_ema      = float((mg_ctx or {}).get("global_psnr_ema", psnr))
+        mg_idx     = int((mg_ctx or {}).get("mg_frame_idx", 1))
+        delta_inter= float(getattr(cfg, "inter_smooth_huber_delta", 0.80))
+        w_inter    = float(getattr(cfg, "w_inter", 0.15))
+        inter_K    = int(getattr(cfg, "inter_smooth_first_k", 3))
+        inter_gate_sc = float(getattr(cfg, "inter_gate_sc", 0.0))  # 0 disables in SC mg
+        if mg_idx <= max(1, inter_K):
+            gate = (inter_gate_sc if has_sc_in_mg else 1.0)
+            inter_pen = - gate * w_inter * _huber_abs(psnr - g_ema, delta_inter)
+
+    # ----- bit-term with PSNR target gating -----
+    if mg_ctx is not None and "lambda" not in mg_ctx:
+        mg_ctx["lambda"] = float(getattr(cfg, "lambda_init", 1e-3))
+        mg_ctx["lambda_lo"] = float(getattr(cfg, "lambda_lo", 1e-6))
+        mg_ctx["lambda_hi"] = float(getattr(cfg, "lambda_hi", 1e+2))
+    lam = float((mg_ctx or {}).get("lambda", getattr(cfg, "lambda_init", 1e-3)))
+
+    if mg_ctx is not None:
+        avg_psnr_ema = float(mg_ctx.get("avg_psnr_ema", psnr))
+        ema_b = float(getattr(cfg, "avg_psnr_ema_beta", 0.98))
+        avg_psnr_ema = ema_b * avg_psnr_ema + (1.0 - ema_b) * psnr
+        mg_ctx["avg_psnr_ema"] = avg_psnr_ema
+        psnr_target_db = float(getattr(cfg, "psnr_target_db", 40.5))
+        gate = float(getattr(cfg, "bit_gate_hi", 1.0)) if avg_psnr_ema >= psnr_target_db \
+            else float(getattr(cfg, "bit_gate_lo", 0.25))
+    else:
+        gate = 1.0
+
+    bits_norm = bits / max(1.0, pf_norm)
+    bit_term  = - gate * lam * bits_norm
+
+    # ----- scene-cut mg: boost P (last frame) -----
+    sc_p_quality_boost = float(getattr(cfg, "sc_p_quality_boost", 0.80))
+    sc_p_bit_gate      = float(getattr(cfg, "sc_p_bit_gate", 0.60))
+    is_last_frame_of_mg= (frames_left == 1)
+    if has_sc_in_mg and is_last_frame_of_mg:
+        barg     = (1.0 + sc_p_quality_boost) * barg
+        bit_term = sc_p_bit_gate * bit_term
+
+    # ----- update lambda at mg end -----
+    if mg_ctx is not None and is_last_frame_of_mg and mg_bits_tgt > 0.0:
+        used_before = max(0.0, mg_bits_tgt - mg_bits_rem)
+        used_after  = used_before + bits
+        err_mg = (used_after - mg_bits_tgt) / max(1.0, mg_bits_tgt)
+        amp = float(getattr(cfg, "mg_early_amp", 1.0))
+        exp = float(getattr(cfg, "mg_early_exp", 0.9))
+        prog = float(max(0.0, min(1.0, (mg_bits_tgt - mg_bits_rem) / max(1.0, mg_bits_tgt))))
+        early = (1.0 + amp * (prog ** exp))
+        eta = float(getattr(cfg, "lambda_eta", 0.5))
+        _nash_update_lambda(mg_ctx, eta * early * err_mg,
+                            getattr(cfg, "lambda_lo", 1e-6),
+                            getattr(cfg, "lambda_hi", 1e+2))
+
+    # ----- magnitude balancing (stabilize training) -----
     use_balance = bool(getattr(cfg, "reward_balance_auto", True))
     bal_ema_mom = float(getattr(cfg, "reward_balance_momentum", 0.95))
-    target_mag  = float(getattr(cfg, "reward_balance_target_mag", 0.8))  # 目标平均幅度
+    target_mag  = float(getattr(cfg, "reward_balance_target_mag", 0.8))
+    s_q = 1.0; s_b = 1.0
+    if use_balance and mg_ctx is not None:
+        ema_q = float(mg_ctx.get("ema_abs_q", 0.0))
+        ema_b = float(mg_ctx.get("ema_abs_b", 0.0))
+        cur_abs_q = abs(barg + smooth_pen + grad_pen + inter_pen)
+        cur_abs_b = abs(bit_term)
+        ema_q = bal_ema_mom * ema_q + (1.0 - bal_ema_mom) * cur_abs_q
+        ema_b = bal_ema_mom * ema_b + (1.0 - bal_ema_mom) * cur_abs_b
+        s_q = (target_mag / max(1e-6, ema_q)) if ema_q > 0 else 1.0
+        s_b = (target_mag / max(1e-6, ema_b)) if ema_b > 0 else 1.0
+        s_q = float(max(0.5, min(2.0, s_q)))
+        s_b = float(max(0.5, min(2.0, s_b)))
+        mg_ctx["ema_abs_q"] = float(ema_q)
+        mg_ctx["ema_abs_b"] = float(ema_b)
 
-    # 其他
-    min_bpf     = float(getattr(cfg, "min_bpf", 500.0))
-    clip_mag    = float(getattr(cfg, "reward_clip", 1.5))
-    scale       = float(getattr(cfg, "reward_scale", 1.0))
+    # ----- aggregate -----
+    r = s_q * (barg + smooth_pen + grad_pen + inter_pen) + s_b * (bit_term)
 
-    # ---------- 1) 失真项：PSNR 单调奖励 ----------
-    q_term = math.tanh((psnr - q_mid) / max(1e-6, q_span))  # 约 (-0.96, +0.96)
-
-    # ---------- 2) 帧级码率项（容忍 + Huber） ----------
-    if pred_pf > 0.0:
-        ref_pf = pred_pf
-    elif mg_bits_rem > 0.0 and frames_left_mg >= 1:
-        ref_pf = mg_bits_rem / max(1, frames_left_mg)
-    elif plan_pf > 0.0:
-        ref_pf = plan_pf
-    else:
-        ref_pf = min_bpf
-
-    err_pf = (bits - ref_pf) / max(1.0, ref_pf)
-    b_frame_mag = _soft_tol_penalty(err_pf, tol=pf_tol, delta=pf_hub)
-    b_frame = - b_frame_mag
-
-    # ---------- 3) mini-GOP 级码率项（仅末帧） ----------
-    b_mg = 0.0
-    if frames_left_mg == 1 and mg_bits_tgt > 0.0:
+    # final mg deviation penalty (soft) to tighten budget
+    if is_last_frame_of_mg and mg_bits_tgt > 0.0:
         used_before = max(0.0, mg_bits_tgt - mg_bits_rem)
         used_after  = used_before + bits
         err_mg = (used_after - mg_bits_tgt) / mg_bits_tgt
-        b_mg_mag = _soft_tol_penalty(err_mg, tol=mg_tol, delta=mg_hub)
-        b_mg = - b_mg_mag
-    else:
-        b_mg_mag = 0.0
+        mg_tol  = float(getattr(cfg, "mg_tol", 0.05))
+        mg_hub  = float(getattr(cfg, "mg_huber_delta", 0.05))
+        r += - _soft_tol_penalty(err_mg, tol=mg_tol, delta=mg_hub)
 
-    # ---------- 4) 自适应平衡（可关） ----------
-    s_q = 1.0; s_b = 1.0
-    if use_balance:
-        if mg_ctx is not None:
-            ema_q = float(mg_ctx.get("ema_abs_q", 0.0))
-            ema_b = float(mg_ctx.get("ema_abs_b", 0.0))
-        else:
-            ema_q = 0.0; ema_b = 0.0
-
-        cur_abs_q = abs(w_q * q_term)
-        cur_abs_b = abs(w_bf * b_frame + w_bmg * b_mg)
-
-        ema_q = bal_ema_mom * ema_q + (1.0 - bal_ema_mom) * cur_abs_q
-        ema_b = bal_ema_mom * ema_b + (1.0 - bal_ema_mom) * cur_abs_b
-
-        # 目标把两路项都拉到 ~target_mag 的平均幅度
-        s_q = (target_mag / max(1e-6, ema_q)) if ema_q > 0 else 1.0
-        s_b = (target_mag / max(1e-6, ema_b)) if ema_b > 0 else 1.0
-        # 可再夹一下，避免剧烈缩放
-        s_q = float(max(0.5, min(2.0, s_q)))
-        s_b = float(max(0.5, min(2.0, s_b)))
-
-        if mg_ctx is not None:
-            mg_ctx["ema_abs_q"] = ema_q
-            mg_ctx["ema_abs_b"] = ema_b
-
-    # ---------- 5) 汇总 ----------
-    r = s_q * (w_q * q_term) + s_b * (w_bf * b_frame + w_bmg * b_mg)
-    r = max(-clip_mag, min(clip_mag, r))
-    return float(r * scale)
+    clip_mag = float(getattr(cfg, "reward_clip", 1.5))
+    scale    = float(getattr(cfg, "reward_scale", 1.0))
+    r = float(max(-clip_mag, min(clip_mag, r))) * scale
+    return r
 
 
-def compute_reward_dual(cfg, fb: dict, rq_meta: dict) -> tuple[float, float]:
-    """Return (rD, rR) for the dual-critic setting.
-    - rD: 每帧失真奖励（随 PSNR 单调，tanh 形状，约在 -1..+1）
-    - rR: 码率项。
-          * 若“到上一帧”为止的平均PSNR 已达标：直接鼓励省码（比特越少越好）
-          * 若未达标：允许预算放宽（如 1.5×），一旦累计超额，从当前帧起每帧给负向 rR，
-            支持“越早越重”的放大与严重超额的额外重罚。
-    """
-    # ----------- 失真项 rD（与原逻辑一致）-----------
-    psnr_y = _float(fb.get("psnr_y", 0.0))
-    pu = _float(fb.get("psnr_u", 0.0)); pv = _float(fb.get("psnr_v", 0.0))
-    psnr_mode = str(getattr(cfg, "psnr_mode", "y")).lower()
-    if psnr_mode == "yuv" and psnr_y > 0 and pu > 0 and pv > 0:
-        psnr = (6 * psnr_y + pu + pv) / 8.0
-    else:
-        psnr = psnr_y
-
-    q_mid = float(getattr(cfg, "q_mid_db", 38.0))
-    q_span = float(getattr(cfg, "q_span_db", 2.0))
-    rD = float(math.tanh((psnr - q_mid) / max(1e-6, q_span)))
-
-    # ----------- 码率项 rR：达标→省码；未达标→放宽阈值再惩罚 -----------
-    mg_bits_tgt = _float(rq_meta.get("mg_bits_tgt", 0.0))
-    mg_bits_rem = _float(rq_meta.get("mg_bits_rem", 0.0))
-    bits        = _float(fb.get("bits", 0.0))
-
-    # 平均PSNR门控（到上一帧为止）
-    avg_so_far = _float(rq_meta.get("mg_avg_psnr_so_far", -1.0))
-    avg_target = float(getattr(cfg, "avg_psnr_target_db",
-                        getattr(cfg, "psnr_target_db", 0.0)))
-    relax_fac  = float(getattr(cfg, "bit_relax_max_factor", 1.5))
-    base_fac   = float(getattr(cfg, "rR_target_factor", 1.0))
-    use_fac    = (relax_fac if (avg_so_far >= 0.0 and avg_so_far < avg_target) else base_fac)
-    # === 新逻辑：按 threshold_frame_bits 计算 mini-GOP 总上限，并应用放宽因子 ===
-    mg_cap_total = _mg_cap_total_from_threshold_meta(rq_meta)  # 目标口径的 mini-GOP 总上限（bit）
-    tgt_eff = mg_cap_total * use_fac
-    # 进度 progress∈[0,1]：越早超（progress 小），惩罚放大越多
-    if mg_bits_tgt > 0.0:
-        progress = (mg_bits_tgt - mg_bits_rem) / mg_bits_tgt
-        progress = max(0.0, min(1.0, float(progress)))
-    else:
-        progress = 1.0
-
-    # 累计用比特（上一帧止）优先用 RL 端真实累计，避免 rem 被夹到0造成偏差
-    hint = rq_meta.get("mg_used_before", None)
-    if hint is not None:
-        used_before = float(hint)
-    else:
-        used_before = (mg_bits_tgt - mg_bits_rem)
-    used_after = used_before + bits
-
-    # === 达标：比特越少越好（直接对本帧 bits 给负向奖励） ===
-    if (avg_so_far >= 0.0 and avg_so_far >= avg_target and mg_bits_tgt > 0.0):
-        w_save = float(getattr(cfg, "w_rate_satisfied", 0.6))  # 可在 config 中覆盖
-        rR = - w_save * (bits / max(1.0, mg_bits_tgt))
-
-    # === 未达标：按放宽后的目标预算判定是否超额并惩罚 ===
-    elif mg_bits_tgt > 0.0 and tgt_eff > 0.0 and used_after > tgt_eff:
-        over_frac = (used_after - tgt_eff) / max(1.0, tgt_eff)
-
-        # 早超放大：progress 越小（越早），放大因子越大
-        amp_base = float(getattr(cfg, "mg_early_amp", 1.0))   # 如 1.0
-        amp_exp  = float(getattr(cfg, "mg_early_exp", 0.9))   # 如 0.9
-        early_amp = 1.0 + amp_base * pow(progress, amp_exp)  # progress 越大 → early_amp 越大
-
-        w_over = float(getattr(cfg, "w_mg_over", 0.8))        # 常规累计超额惩罚
-        rR = - w_over * over_frac * early_amp
-
-        # 严重超额（如 ≥ 2×）额外重罚
-        hard_ratio = float(getattr(cfg, "mg_over_hard_ratio", 2.0))
-        if used_after >= hard_ratio * tgt_eff:
-            w_hard = float(getattr(cfg, "w_mg_over_hard", 3.5))
-            extra = (used_after - hard_ratio * tgt_eff) / max(1.0, tgt_eff)
-            rR += - w_hard * max(0.0, extra)
-
-    else:
-        # 未超且未达标：不惩罚（把码率弹性留给“达标前提”的提质）
-        rR = 0.0
-
-    return float(rD), float(rR)
-
+def compute_reward_dual(cfg, fb: dict, rq_meta: dict,
+                        prev_psnr_cached: float = 0.0,
+                        mg_ctx: dict | None = None):
+    return compute_reward(cfg, fb, rq_meta, prev_psnr_cached, mg_ctx)

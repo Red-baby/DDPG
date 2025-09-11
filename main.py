@@ -40,11 +40,11 @@ def parse_args():
 
     # 方式一：与原来一致，手工传多条 --videos（每条内部用“|”分隔参数）
     ap.add_argument("--videos", type=str, nargs="+", default=[
-        "--input|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24.yuv|"
+        "--input|E:/ftp/summer_of_adventure_1920x1080_30.yuv|"
         "--input-res|1920x1080|"
         "--frames|0|"
-        "--o|E:/Git/qav1_ori/qav1/workspace//park_mobile_1920x1080_24.ivf|"
-        "--csv|E:/Git/qav1_ori/qav1/workspace/park_mobile_1920x1080_24_822.csv|"
+        "--o|E:/Git/qav1_ori/qav1/workspace/summer_of_adventure_1920x1080_30.ivf|"
+        "--csv|E:/Git/qav1_ori/qav1/workspace/summer_of_adventure_1920x1080_30.csv|"
         "--bitrate|2125|"
         "--rc-mode|1|"
         "--pass|2|"
