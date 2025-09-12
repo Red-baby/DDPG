@@ -1,192 +1,116 @@
 # -*- coding: utf-8 -*-
-"""
-以“视频为单位”的 epoch 训练/验证入口（每个 epoch 启动一次编码器）：
-- 方式一：--videos 手工传多条命令（每条内部用“|”分隔）；每个 epoch 轮转一条；
-- 方式二：数据集模式（推荐多序列）：--dataset-* 自动生成每条 2-pass 命令（含 --stat-in）；
-- 不与 run_2pass.py 耦合；数据集逻辑下沉到 dataset.py。
-"""
-
-import os
-import argparse
-import threading
-import glob
-from typing import Optional, List
-
-from pathlib import Path
+import os, argparse, threading
+from typing import List
 from config import Config
 from io_runner import RLRunner
 from encoder_proc import launch_encoder, start_monitor
-import dataset as ds
+from dataset import add_dataset_args, build_cmds_from_dataset
 
-
-# ---------------------
-# 参数解析
-# ---------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-
-    # 基本参数
     ap.add_argument("--rl-dir", type=str, default=Config.rl_dir)
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--start-epoch", type=int, default=0,
-                    help="起始 epoch 编号，用于继续训练时的显示与命名")
-    ap.add_argument("--mode", type=str, default="train", choices=["train", "val", "infer"])
-    ap.add_argument("--encoder", type=str,
-                    default=r"E:\Git\qav1_ori\qav1\build\vs2022\x64\Release\qav1enc.exe")
-    ap.add_argument("--resume", type=str, default=r"",
-                    help="可选：ckpt 文件或目录；从该 checkpoint 继续训练/验证")
-    ap.add_argument("--ckpt-prefix", type=str, default="ckpt",
-                    help="保存检查点的前缀名")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--start-epoch", type=int, default=1)
+    ap.add_argument("--mode", type=str, default="train", choices=["train","val","infer"])
+    ap.add_argument("--encoder", type=str, default=Config.encoder_path)
+    ap.add_argument("--resume", type=str, default="")
+    ap.add_argument("--ckpt-prefix", type=str, default="ckpt")
 
-    # 方式一：与原来一致，手工传多条 --videos（每条内部用“|”分隔参数）
+    # 切换：单视频/数据集
+    ap.add_argument("--use-dataset", action="store_true", help="启用数据集模式（从 --dataset-inputs 自动发现 YUV）")
+
+    # 单视频命令模式（每条内部用 | 分隔）
     ap.add_argument("--videos", type=str, nargs="+", default=[
-        "--input|E:/ftp/summer_of_adventure_1920x1080_30.yuv|"
-        "--input-res|1920x1080|"
-        "--frames|0|"
-        "--o|E:/Git/qav1_ori/qav1/workspace/summer_of_adventure_1920x1080_30.ivf|"
-        "--csv|E:/Git/qav1_ori/qav1/workspace/summer_of_adventure_1920x1080_30.csv|"
-        "--bitrate|2125|"
-        "--rc-mode|1|"
-        "--pass|2|"
-        "--stat-in|E:/Git/qav1_ori/qav1/workspace/1pass.log|"
-        "--stat-out|E:/Git/qav1_ori/qav1/workspace/2pass.log|"
-        "--score-max|50.5|"
-        "--score-avg|40.5|"
-        "--score-min|38.5|"
-        "--fps|30|"
-        "--preset|0|"
-        "--keyint|225|"
-        "--bframes|15|"
-        "--threads|1|"
-        "--parallel-frames|1|"
-        "--bitrate|2125"
+        "--input|E:/Git/qav1/workspace/park_mobile_1920x1080_24.yuv|--input-res|1920x1080|--frames|0|"
+        "--o|E:/out/demo.ivf|--csv|E:/out/demo.csv|--bitrate|2125|--rc-mode|1|--pass|2|"
+        "--stat-in|./pass1.log|--stat-out|E:/Git/qav1/workspace/demo_pass2.log|"
+        "--score-max|50.5|--score-avg|40.5|--score-min|38.5|--fps|24|--preset|1|"
+        "--keyint|225|--bframes|15|--threads|1|--parallel-frames|1"
     ])
 
-    # 方式二：数据集模式（新增，参数由 dataset.py 注入）
-    ds.add_dataset_args(ap)
-
+    # 注入数据集相关参数（不使用 manifest）
+    add_dataset_args(ap)
     return ap.parse_args()
 
+def _split_cmd_bar(cmd_str: str) -> List[str]:
+    # 把 " --k|v|--k2|v2 " 拆成 argv
+    return [p for p in cmd_str.split("|") if p]
 
-# ---------------------
-# 恢复 ckpt
-# ---------------------
-def _latest_ckpt(path_or_dir: str) -> Optional[str]:
-    if not path_or_dir:
-        return None
-    p = os.path.abspath(path_or_dir)
-    if os.path.isdir(p):
-        cands = sorted(glob.glob(os.path.join(p, "*.pth")) + glob.glob(os.path.join(p, "*.pt")))
-        return cands[-1] if cands else None
-    if os.path.isfile(p):
-        return p
-    return None
+def _find_arg(args: List[str], key: str, default: str = "") -> str:
+    try:
+        i = args.index(key)
+        return args[i+1] if i+1 < len(args) else default
+    except ValueError:
+        return default
 
+def _infer_twopass_from_stat_in(stat_in: str) -> str:
+    if not stat_in:
+        return ""
+    # 只把 pass1 替换成 pass2；路径其它部分不动
+    return stat_in.replace("pass1", "pass2")
 
-# ---------------------
-# 主流程
-# ---------------------
+def _run_one_video(runner: RLRunner, cfg: Config, argv: List[str], epoch_id: int, epoch_total: int):
+    # 自动推导 2-pass 基线
+    stat_in = _find_arg(argv, "--stat-in", "")
+    tp_path = _infer_twopass_from_stat_in(stat_in)
+    if tp_path and not os.path.exists(tp_path):
+        print(f"[MAIN][WARN] 2-pass baseline not found: {tp_path}")
+
+    # 继承 FPS（用于统计 kbps）
+    fps = _find_arg(argv, "--fps", "")
+    if fps:
+        try: cfg.fps = int(fps)
+        except: pass
+
+    # 把基线路径挂到 cfg（io_runner/reward 内部如果需要会从 cfg 读取）
+    runner.cfg.twopass_log_path = tp_path
+
+    # 设置 epoch（不改变其它回放/计数器逻辑）
+    runner.set_epoch(idx=epoch_id, total=epoch_total, twopass_log_path=tp_path)
+
+    # 启动编码器并进入服务循环
+    enc = launch_encoder(cfg, argv)
+    stop_evt = threading.Event()
+    _ = start_monitor(enc, cfg, runner, stop_evt)
+    runner.serve_loop(stop_evt)
+
 def main():
     args = parse_args()
-
     cfg = Config(rl_dir=args.rl_dir, mode=args.mode)
     if args.encoder:
         cfg.encoder_path = args.encoder
 
-    if not os.path.exists(cfg.encoder_path):
-        print(f"[ERROR] 编码器不存在：{cfg.encoder_path}")
-        print("请检查 config.py 的 encoder_path 或使用 --encoder 指定正确路径")
-        return
-
-    # Runner（RL agent + I/O）
     runner = RLRunner(cfg)
 
-    # 断点恢复（可给目录或具体文件）
-    ckpt_path = _latest_ckpt(args.resume)
-    if ckpt_path:
-        try:
-            ckpt = runner.agent.load_checkpoint(ckpt_path)
-            try:
-                sn = ckpt.get("state_norm", None)
-                if sn is not None:
-                    runner.sb.norm.load_state_dict(sn)
-                    print(f"[MAIN] resumed from: {ckpt_path} (with state_norm)")
-                else:
-                    print(f"[MAIN] resumed from: {ckpt_path} (no state_norm)")
-            except Exception as e:
-                print(f"[MAIN][WARN] failed to restore state_norm: {e}")
-        except Exception as e:
-            print(f"[MAIN][WARN] failed to load checkpoint: {e}")
-
-    # 计算 epoch 范围（用于显示/命名）
     start_ep = int(max(1, args.start_epoch))
     end_ep   = start_ep + int(max(1, args.epochs)) - 1
-    total_for_print = end_ep
 
-    # 构造“每个 epoch 一条命令”的列表
-    video_cmds: List[List[str]] = []
+    if bool(args.use_dataset):
+        # ===== 数据集模式：从 --dataset-inputs 构建所有 2-pass 命令 =====
+        cmds = build_cmds_from_dataset(args, cfg)  # list[list[str]]
+        if not cmds:
+            print("[MAIN] no dataset commands built; exit.")
+            return
 
-    if 0:#args.dataset_inputs:
-        # 数据集模式：自动从 --dataset-* 生成 2-pass 命令（含 --stat-in / --csv / --stat-out / --o）
-        video_cmds = ds.build_cmds_from_dataset(args, cfg)
+        epoch_total = (end_ep - start_ep + 1) * max(1, len(cmds))
+        eid = start_ep
+        for ep in range(start_ep, end_ep + 1):
+            # 简单按原顺序；如需打乱可在这里 random.shuffle(cmds.copy())
+            for cmd_argv in cmds:
+                _run_one_video(runner, cfg, cmd_argv, epoch_id=eid, epoch_total=epoch_total)
+                eid += 1
+        print("[MAIN] dataset training finished.")
     else:
-        # 兼容原用法：--videos 多条命令，每条内部用 |
-        for vstr in args.videos:
-            parts = [p for p in vstr.split("|") if p]
-            if parts:
-                video_cmds.append(parts)
-
-    if not video_cmds:
-        print("[MAIN][ERROR] 需要至少一种输入：要么给 --dataset-inputs，要么给 --videos")
-        return
-
-    # ===== epoch 循环（保持原风格：每个 epoch 跑 1 条命令，顺序轮转）=====
-    # 说明：下方“铺平循环”的写法，确保 epoch 数量 > 命令数量时会从头继续轮转。
-    repeat = (end_ep - start_ep + 1 + len(video_cmds) - 1) // len(video_cmds)
-    flat_cmds = video_cmds * repeat
-
-    for i, vcmd in enumerate(flat_cmds):
-        ep_idx = start_ep + i
-        if ep_idx > end_ep:
-            break
-
-        runner.set_epoch(ep_idx, total_for_print)
-        print(f"\n[MAIN] ===== Epoch {ep_idx}/{total_for_print} | mode={cfg.mode} =====")
-        print(f"[MAIN] Launch encoder args: {vcmd}")
-
-        stop_evt = threading.Event()
-        enc = launch_encoder(cfg, vcmd)
-        mon_thr = start_monitor(enc, cfg, runner, stop_evt)
-
-        try:
-            runner.serve_loop(stop_evt)
-        except KeyboardInterrupt:
-            print("\n[MAIN] keyboard interrupt; stopping.")
-            stop_evt.set()
-        finally:
-            if cfg.kill_encoder_on_exit and (enc.poll() is None):
-                enc.kill()
-            mon_thr.join(timeout=1.0)
-
-        # 保存 ckpt（仅训练）
-        if cfg.mode == "train":
-            os.makedirs(cfg.ckpt_dir, exist_ok=True)
-            ckpt_name = f"{args.ckpt_prefix}_e{ep_idx:04d}.pth"
-            ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
-            extra = {"state_norm": runner.sb.norm.state_dict()}
-            runner.agent.save_checkpoint(ckpt_path, extra=extra)
-            print(f"[MAIN] checkpoint saved: {ckpt_path} (with state_norm)")
-
-        # 重置跨 epoch 的统计（保持你原有节奏）
-        runner.mg_bits_tgt_total = 0.0
-        runner._seen_mg_ids.clear()
-        runner._gop_plan_bits.clear()
-        runner._gop_init_rem.clear()
-        runner._curr_gop_id = 0
-        runner._last_frames_left_gop = None
-
-    print("[MAIN] all epochs done. bye.")
-
+        # ===== 单视频命令模式（支持 --epochs）=====
+        epoch_total = (end_ep - start_ep + 1) * max(1, len(args.videos))
+        eid = start_ep
+        for ep in range(start_ep, end_ep + 1):
+            # 如需每个 epoch 打乱顺序，可以：cmds = args.videos.copy(); random.shuffle(cmds)
+            for cmd_bar in args.videos:
+                argv = _split_cmd_bar(cmd_bar)
+                _run_one_video(runner, cfg, argv, epoch_id=eid, epoch_total=epoch_total)
+                eid += 1
+        print("[MAIN] single-video list finished.")
 
 if __name__ == "__main__":
     main()

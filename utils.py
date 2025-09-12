@@ -1,109 +1,139 @@
 # -*- coding: utf-8 -*-
-import os, json, time
+"""
+utils.py
+通用 I/O 与小工具：
+- safe_read_json(path): 容错读取 JSON
+- safe_write_text(path, text): 先写到 .tmp，再带重试地替换目标（Windows 友好）
+- try_remove(path): 安静删除
+- now_ms(): 毫秒时间戳
+- _float/_int: 容错数值转换
+"""
+
+from __future__ import annotations
+import os, io, json, time, tempfile, shutil
+
+__all__ = [
+    "safe_read_json", "safe_write_text", "try_remove", "now_ms",
+    "_float", "_int"
+]
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-def try_remove(path: str):
+def _float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+def _int(x, default: int = 0) -> int:
+    try:
+        if x is None:
+            return int(default)
+        if isinstance(x, (int,)):
+            return int(x)
+        s = str(x).strip()
+        if s == "":
+            return int(default)
+        # 允许 "123.0" 这种
+        return int(float(s))
+    except Exception:
+        return int(default)
+
+def safe_read_json(path: str, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # 再试一次（可能是部分写入）
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            return json.loads(txt)
+        except Exception:
+            return default
+
+def try_remove(path: str) -> None:
     try:
         os.remove(path)
-    except Exception:
+    except FileNotFoundError:
         pass
-
-def safe_write_text(path: str, text: str, retries: int = 64, backoff_ms: int = 2) -> None:
-    """
-    原子写入（.tmp -> 目标）+ Windows 共享冲突友好：
-    1) 先写到 path+".tmp"，flush + fsync；
-    2) 尝试 os.replace(tmp, path)；
-       - 若目标被其他进程占用（WinError 5），指数退避重试；
-    3) 多次失败后，降级为“直接写目标文件”（同样带重试与 fsync）；
-    4) 最后清理 .tmp（忽略错误）。
-    """
-    import os, time, io
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-
-    # 1) 写临时文件
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-        f.flush()
+    except PermissionError:
+        # Windows 有时需要改名后再删
         try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass  # 某些文件系统可能不支持 fsync，到此也没关系
-
-    # 2) 尝试原子替换（优先方案）
-    last_err = None
-    for i in range(max(1, int(retries))):
-        try:
-            os.replace(tmp, path)  # 成功即返回
-            return
-        except PermissionError as e:
-            # 目标可能被占用（WinError 5），退避后重试
-            last_err = e
-            # 指数退避，但上限 256ms，避免阻塞太久
-            sleep_ms = min(backoff_ms * (2 ** i), 256)
-            time.sleep(sleep_ms / 1000.0)
-        except OSError as e:
-            # 其他 OSError：短暂等待再试
-            last_err = e
-            time.sleep(backoff_ms / 1000.0)
-
-    # 3) 降级为“直接写目标文件”（同样带重试）
-    for i in range(max(1, int(retries))):
-        try:
-            with open(path, "w", encoding="utf-8", newline="\n") as f2:
-                f2.write(text)
-                f2.flush()
-                try:
-                    os.fsync(f2.fileno())
-                except OSError:
-                    pass
-            # 写成功就退出
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            return
-        except PermissionError as e:
-            last_err = e
-            sleep_ms = min(backoff_ms * (2 ** i), 256)
-            time.sleep(sleep_ms / 1000.0)
-        except OSError as e:
-            last_err = e
-            time.sleep(backoff_ms / 1000.0)
-
-    # 4) 仍失败：尽量清理 tmp，并抛出更友好的错误
-    try:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    except OSError:
-        pass
-    raise PermissionError(
-        f"safe_write_text: failed to write '{path}' after retries; "
-        f"target may be locked by another process. last_err={last_err}"
-    )
-
-def safe_read_json(path: str, retries: int = 50, sleep_ms: int = 2):
-    for _ in range(retries):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            bkup = path + ".del"
+            if os.path.exists(bkup):
+                os.remove(bkup)
+            os.replace(path, bkup)
+            os.remove(bkup)
         except Exception:
-            time.sleep(sleep_ms / 1000.0)
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _int(v, default=0):
-    try:
-        return int(v)
+            pass
     except Exception:
-        return default
+        pass
 
-def _float(v, default=0.0):
+def _atomic_replace(src: str, dst: str) -> None:
+    """
+    原子替换，兼容 Windows：先尝试 os.replace；失败则删除目标后再 replace；
+    再失败则用拷贝替换的兜底。
+    """
     try:
-        return float(v)
+        os.replace(src, dst)
+        return
+    except PermissionError:
+        # 目标可能被占用：试图删除再替换
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.replace(src, dst)
+            return
+        except Exception:
+            pass
     except Exception:
-        return default
+        pass
+    # 兜底：拷贝
+    try:
+        shutil.copyfile(src, dst)
+        os.remove(src)
+    except Exception:
+        # 最后兜底：把 tmp 保留下来，至少不丢数据
+        pass
+
+def safe_write_text(path: str, text: str, retries: int = 6, backoff_ms: int = 20) -> None:
+    """
+    将文本安全写入 path：
+      - 写到同目录的临时文件，再原子替换；
+      - Windows 下带重试，缓解 WinError 5。
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    # 用 NamedTemporaryFile 保证跨盘也能 replace
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d, text=True)
+    try:
+        with io.open(tmp_fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        # 带重试的原子替换
+        for i in range(max(1, int(retries))):
+            _atomic_replace(tmp_path, path)
+            # 校验：成功后文件应存在且大小>0（允许写空行则去掉大小校验）
+            try:
+                if os.path.exists(path):
+                    return
+            except Exception:
+                pass
+            time.sleep(backoff_ms / 1000.0)
+    finally:
+        # 清理遗留 tmp
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
