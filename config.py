@@ -5,13 +5,13 @@ import torch
 @dataclass
 class Config:
     # ===== 基本运行 =====
-    rl_dir: str = r"E:\python\DDPG\rl_io"
+    rl_dir: str = r"./rl_io"
     mode: str = "train"                  # "train" | "val" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ===== 编码器可执行路径（main.py 可覆盖）=====
-    encoder_path: str = r"E:\Git\qav1_ori\qav1\build\vs2022\x64\Debug\qav1enc.exe"
+    encoder_path: str = r"./qav1enc.exe"
 
     # ===== 切换：单视频命令 vs 数据集模式 =====
     use_dataset: bool = False            # True=数据集模式；False=单视频模式
@@ -30,8 +30,8 @@ class Config:
     actor_lr: float = 1e-4
     critic_lr: float = 2e-4
     batch_size: int = 32
-    replay_size: int = 50000
-    warmup_steps: int = 2000
+    replay_size: int = 1000
+    warmup_steps: int = 500
     train_steps_per_env_step: int = 4
     policy_noise: float = 0.10
     noise_clip: float = 0.20

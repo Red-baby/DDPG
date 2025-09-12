@@ -128,9 +128,9 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
         ref_psnr_avg   = float(_float(mg_ctx.get("ref_psnr_avg",   rq_meta.get("ref_psnr_avg",   0.0))))
         # λ来源：mg_ctx -> rq_meta -> cfg 初值
         lambda_b = float(_float(mg_ctx.get("lambda_b",
-                          rq_meta.get("lambda_b", getattr(cfg, "lag_init_b", 0.0)))))
+                  rq_meta.get("lambda_b", getattr(cfg, "lag_b_init", 0.0)))))
         lambda_q = float(_float(mg_ctx.get("lambda_q",
-                          rq_meta.get("lambda_q", getattr(cfg, "lag_init_q", 0.0)))))
+                  rq_meta.get("lambda_q", getattr(cfg, "lag_q_init", 0.0)))))
 
         if ref_bits_total > 0.0:
             used_before = float(_float(rq_meta.get("mg_used_before", 0.0)))
