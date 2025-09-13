@@ -7,7 +7,7 @@
 """
 import csv, os, glob, time, numpy as np, torch
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from utils import safe_read_json, safe_write_text, try_remove, now_ms, _float, _int
 from state import StateBuilder, STATE_FIELDS
 from agent import get_agent
@@ -24,7 +24,7 @@ class _CrossMGCtx:
         self.mg_idx = 0
         self.has_sc = False
         self.beta = float(psnr_beta)
-    def on_new_request(self, rq: dict) -> Tuple[dict, dict]:
+    def on_new_request(self, rq: dict):
         mg_size = max(1, int(rq.get("mg_size", 16)))
         frames_left = max(1, int(rq.get("frames_left_mg", 1)))
         if frames_left == mg_size:
@@ -76,10 +76,8 @@ class RLRunner:
         self._rew_ema_q = 0.0
         self._rew_ema_b = 0.0
 
-        # GOP/miniGOP 统计
-        self._curr_gop_id = 0
-        self._last_frames_left_gop = None
-        self.mg_stats: Dict[Tuple[int,int], dict] = {}  # (gop_id, mg_idx) -> stats
+        # miniGOP 统计（以 mg_id 为唯一键，不再使用 GOP 分组）
+        self.mg_stats: Dict[int, dict] = {}  # mg_id -> stats
 
         # Lagrangian 乘子
         self.lambda_b = float(getattr(cfg, "lag_b_init", 0.0))
@@ -175,58 +173,56 @@ class RLRunner:
                 rq = safe_read_json(rq_path)
             except Exception as e:
                 print(f"[RL][WARN] bad rq json {rq_path}: {e}")
-                try_remove(rq_path); continue
+                try_remove(rq_path)
+                continue
 
-            # 兜底 mg_index：若编码器未提供，就用 poc/mg_size 推算
-            mg_idx = _int(rq.get("mg_index", None))
-            if mg_idx is None:
+            # —— 直接使用编码器提供的 mg_id（稳定的 miniGOP 编号）——
+            mg_id = int(_int(rq.get("mg_id", -1)))
+            if mg_id < 0:
+                # 兜底：若编码器未提供 mg_id，再退化为 POC 推算
                 poc = _int(rq.get("poc", -1))
                 mg_size = max(1, _int(rq.get("mg_size", 16)))
-                mg_idx = (poc - 1) // mg_size if (poc is not None and poc >= 0) else 0
-                rq["mg_index"] = mg_idx  # 补回请求字典，后续 meta 会带上
+                mg_len = mg_size + 1
+                mg_id = (poc - 1) // mg_len if (poc is not None and poc >= 1) else 0
+            rq["mg_id"] = mg_id  # 写回，保证下游一致
+            # mg_index 仅用于日志/诊断，不参与 key
+            mg_index = int(_int(rq.get("mg_index", rq.get("frames_left_mg", -1))))
 
+            # 跨-MG上下文（只做全局EMA/段内计数）
             rq_enriched, mg_ctx_cross = self.mgctx.on_new_request(rq)
+
+            # 状态与 meta
             s, meta = self.sb.build(rq_enriched)
-            # 确保 meta 也携带 mg_index
-            meta["mg_index"] = int(mg_idx)
+            meta["mg_id"] = int(mg_id)
+            meta["mg_index"] = int(mg_index)
 
-            # GOP 计数（仅统计用）
-            flg = _int(rq.get("frames_left_gop", -1))
-            if self._last_frames_left_gop is None:
-                self._last_frames_left_gop = flg
-            else:
-                if flg > self._last_frames_left_gop:  # gop 回绕
-                    self._curr_gop_id += 1
-                self._last_frames_left_gop = flg
-            meta["gop_id"] = self._curr_gop_id
-
-            # 建立 mg 统计
-            key = (self._curr_gop_id, int(mg_idx))
+            # 建立/获取该 miniGOP 的统计对象（以 mg_id 为键）
+            key = int(mg_id)
             st = self.mg_stats.get(key)
             if st is None:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0,
                       "budget": _float(rq.get("mg_bits_tgt", 0.0)),
                       "ref_bits_total": 0.0, "ref_psnr_avg": 0.0}
                 self.mg_stats[key] = st
-                # 2-pass 参考：只在第一次看到该 mg 时放入
-                poc = int(_int(rq_enriched.get("poc", rq.get("poc", -1))))
-                if self.baseline is not None and poc >= 0:
-                    try:
-                        mg_size = int(_int(rq.get("mg_size", 16)))
-                        ref = self.baseline.mg_stats(poc, mg_size=mg_size)
-                        st["ref_bits_total"] = float(ref["bits_total"])
-                        st["ref_psnr_avg"]   = float(ref["psnr_avg"])
-                        st["ref_start_poc"]  = int(ref["start"])
-                        st["ref_end_poc"]    = int(ref["end"])
-                        # print(f"[RL][baseline] mg{key} ref_bits={st['ref_bits_total']} ref_psnr={st['ref_psnr_avg']:.3f}")
-                    except Exception as e:
-                        print(f"[RL][WARN] baseline mg_stats failed for poc={poc}: {e}")
+                # 2-pass 参考只在第一次看到该 mg 时写入
+                if self.baseline is not None:
+                    poc_en = int(_int(rq_enriched.get("poc", rq.get("poc", -1))))
+                    mg_size = max(1, _int(rq.get("mg_size", 16)))
+                    if poc_en >= 0:
+                        try:
+                            ref = self.baseline.mg_stats(poc_en, mg_size=mg_size)
+                            st["ref_bits_total"] = float(ref["bits_total"])
+                            st["ref_psnr_avg"] = float(ref["psnr_avg"])
+                            st["ref_start_poc"] = int(ref["start"])
+                            st["ref_end_poc"] = int(ref["end"])
+                        except Exception as e:
+                            print(f"[RL][WARN] baseline mg_stats failed for poc={poc_en}: {e}")
 
             # 选动作
             explore = (self.cfg.mode == "train")
             qp = self.agent.select_action(s, meta["base_q"], explore=explore)
 
-            # 安全层（可关）：基于剩余预算/剩余帧数的后置修正
+            # 安全层（可关）
             if bool(getattr(self.cfg, "safety_layer_enable", True)):
                 mg_rem = float(_float(rq.get("mg_bits_rem", 0.0)))
                 L = max(1, int(_int(rq.get("frames_left_mg", 1))))
@@ -234,21 +230,21 @@ class RLRunner:
                 pred = float(_float(rq.get("bits_pred_frame", rq.get("bits_plan_frame", 0.0))))
                 if per_allow and pred > 0:
                     slack = float(getattr(self.cfg, "safety_slack", 1.05))
-                    step  = int(getattr(self.cfg, "safety_qp_step", 2))
+                    step = int(getattr(self.cfg, "safety_qp_step", 2))
                     if pred > slack * per_allow:
                         qp = min(qp + step, self.cfg.qp_max)
                     elif pred < per_allow / slack:
                         qp = max(qp - step, self.cfg.qp_min)
 
+            # 写 QP
             qp_path = rq_path.replace(".rq.json", ".qp.txt")
             try:
                 safe_write_text(qp_path, f"{qp}\n")
             except PermissionError as e:
                 print(f"[RL][WARN] safe_write_text failed: {e}")
-
             try_remove(rq_path)
 
-            # 把 “qp→a01” 存入 pending（便于回放）
+            # 记录 pending（用于回放）
             delta_max = float(getattr(self.cfg, "delta_qp_max", 20.0))
             a01 = 0.5 + (float(qp) - float(meta["base_q"])) / (2.0 * delta_max)
             a01 = float(np.clip(a01, 0.0, 1.0))
@@ -297,9 +293,13 @@ class RLRunner:
             self._ep_psnr_sum += float(psnr_obs)
             self._ep_frames += 1
 
-            gop_id = int(pend.meta.get("gop_id", 0))
-            mg_id  = int(pend.meta.get("mg_index", pend.meta.get("mg_id", 0)))
-            key = (gop_id, mg_id)
+            # 以 mg_id 为键，确保同一 miniGOP 累计到同一个 st
+            mg_id = int(_int(pend.meta.get("mg_id", -1)))
+            if mg_id < 0:
+                # 极端兜底：若 meta 里没有 mg_id，就退化使用 mg_index（不建议）
+                mg_id = int(_int(pend.meta.get("mg_index", 0)))
+            key = int(mg_id)
+
             st = self.mg_stats.get(key)
             if st is None:
                 st = {"bits": 0.0, "psnr": 0.0, "frames": 0,
@@ -316,26 +316,23 @@ class RLRunner:
             meta2["mg_avg_psnr_so_far"] = (st["psnr"]/frames_so_far_pre) if frames_so_far_pre>0 else -1.0
 
             # 先累计（便于终止帧统计）
-            st["bits"] += float(bits_obs)
-            st["psnr"] += float(psnr_obs)
+            st["bits"]  += float(bits_obs)
+            st["psnr"]  += float(psnr_obs)
             st["frames"] += 1
 
             done = (_int(fb.get("frames_left_mg", pend.meta.get("frames_left_mg", 1))) == 0)
 
             # ---- 组 mg_ctx 并计算逐帧 r ----
             mg_ctx = {
-                # 注意：传“当前帧之前”的计数，避免 off-by-one
                 "frames_so_far": max(0, frames_so_far_pre),
                 "ema_abs_q": float(self._rew_ema_q),
                 "ema_abs_b": float(self._rew_ema_b),
                 "global_psnr_ema": float(self.mgctx.gema) if self.mgctx.gema > 0 else 0.0,
                 "mg_frame_idx": int(self.mgctx.mg_idx),
                 "has_sc_in_mg": bool(self.mgctx.has_sc),
-                # TD3-Lagrangian 的乘子（供终止帧惩罚使用）
                 "lambda_b": float(self.lambda_b),
                 "lambda_q": float(self.lambda_q),
             }
-            # 如该 mg 有 2-pass 参考，把参考传进 reward
             if "ref_bits_total" in st and "ref_psnr_avg" in st:
                 mg_ctx["ref_bits_total"] = float(st.get("ref_bits_total", 0.0))
                 mg_ctx["ref_psnr_avg"]   = float(st.get("ref_psnr_avg", 0.0))
@@ -367,20 +364,39 @@ class RLRunner:
             # ---- 终止帧：更新乘子 λb/λq（TD3-Lagrangian）----
             if done:
                 ref_bits_total = float(st.get("ref_bits_total", 0.0))
-                ref_psnr_avg   = float(st.get("ref_psnr_avg", 0.0))
+                ref_psnr_avg = float(st.get("ref_psnr_avg", 0.0))
                 if ref_bits_total > 0.0 and st["frames"] > 0:
                     used_after = float(st["bits"])
                     rho = used_after / max(1.0, ref_bits_total)
-                    tol = float(getattr(self.cfg, "ref_bits_tol", 0.10))
-                    c_b = max(0.0, abs(rho - 1.0) - tol)
+
+                    # === 码率主约束：目标区间 [low, high] ===
+                    low = float(getattr(self.cfg, "rate_band_low", 0.90))
+                    high = float(getattr(self.cfg, "rate_band_high", 1.05))
+
+                    # 过带误差：超上界/低于下界
+                    err_over = max(0.0, rho - high)
+                    err_under = max(0.0, low - rho)
+
+                    # 码率代价（主约束，只要出带就>0；带内=0）
+                    c_b = err_over + err_under
+
+                    # 段内平均质量
                     avg_rl = (st["psnr"] / max(1, st["frames"]))
-                    c_q = 0.0 if abs(rho - 1.0) > tol else max(0.0, ref_psnr_avg - avg_rl)
 
-                    # λ ← [λ + η * c]_+ 并截断上限
-                    self.lambda_b = float(min(self.cfg.lag_b_max, max(0.0, self.lambda_b + self.cfg.lag_eta_b * c_b)))
-                    self.lambda_q = float(min(self.cfg.lag_q_max, max(0.0, self.lambda_q + self.cfg.lag_eta_q * c_q)))
+                    # 质量代价（仅在带内才生效；且只在 RL 质量落后参考时>0）
+                    if err_over == 0.0 and err_under == 0.0:
+                        c_q = max(0.0, ref_psnr_avg - avg_rl)
+                    else:
+                        c_q = 0.0
 
-                    print(f"[RL][mg end] gop={gop_id} mg={mg_id} | bits_rl={used_after:.0f} "
+                    # === Lagrange 乘子更新（投影到 [0, max]）===
+                    self.lambda_b = float(min(self.cfg.lag_b_max,
+                                              max(0.0, self.lambda_b + self.cfg.lag_eta_b * c_b)))
+                    self.lambda_q = float(min(self.cfg.lag_q_max,
+                                              max(0.0, self.lambda_q + self.cfg.lag_eta_q * c_q)))
+
+                    mg_id = int(pend.meta.get("mg_id", -1))
+                    print(f"[RL][mg end] mg={mg_id} | bits_rl={used_after:.0f} "
                           f"bits_ref={ref_bits_total:.0f} rho={rho:.3f} | "
                           f"psnr_rl={avg_rl:.3f} psnr_ref={ref_psnr_avg:.3f} | "
                           f"c_b={c_b:.4f} c_q={c_q:.4f} | λb={self.lambda_b:.3f} λq={self.lambda_q:.3f}")

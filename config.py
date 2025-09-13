@@ -42,14 +42,15 @@ class Config:
     target_discretize: bool = True
 
     # ===== Lagrangian：miniGOP 末端约束（对照 2-pass）=====
-    ref_bits_tol: float = 0.10          # 允许 ±10%
+    ref_bits_tol: float = 0.05          # 允许 ±10%
     lag_b_init: float = 0.0
-    lag_q_init: float = 0.0
-    lag_eta_b:  float = 0.5
+    lag_eta_b:  float = 1.5
     lag_eta_q:  float = 0.5
     lag_b_max:  float = 50.0
     lag_q_max:  float = 50.0
-
+    end_penalty_scale: float = 2.0
+    end_span_k:  int = 6
+    end_penalty_no_clip: bool = True
     # ===== Reward 形状项（逐帧）=====
     psnr_min_db: float = 38.0
     nash_eps: float = 1e-6
@@ -94,9 +95,19 @@ class Config:
     reward_balance_target_mag: float = 0.8
     reward_clip: float = 1.5
     reward_scale: float = 1.0
+    # 码率带宽（主约束）
+    rate_band_low = 0.90
+    rate_band_high = 1.05
+    # 质量“超参考”的奖励强度（带内才生效）
+    q_bonus_enable = True
+    q_bonus_gain = 0.25  # 奖励斜率，建议 0.15~0.35
+    q_bonus_cap_db = 0.5  # 单段最多以 0.5 dB 裕量计奖，防过强
+    q_bonus_gate_to_high = True  # ρ 越靠近上沿，奖励越弱，避免被推到 1.05 顶边
 
+    # 建议让 λq 初值>0，使奖励能起效（否则 λq=0 时“负 c_q”也乘成 0）
+    lag_q_init = 0.10
     # ===== 安全层（QP 限幅与回退）=====
-    safety_layer_enable: bool = False
+    safety_layer_enable: bool = True
     safety_slack: float = 1.05
     safety_qp_step: int = 2
 

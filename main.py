@@ -9,7 +9,7 @@ from dataset import add_dataset_args, build_cmds_from_dataset
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rl-dir", type=str, default=Config.rl_dir)
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--start-epoch", type=int, default=1)
     ap.add_argument("--mode", type=str, default="train", choices=["train","val","infer"])
     ap.add_argument("--encoder", type=str, default=Config.encoder_path)
@@ -22,8 +22,8 @@ def parse_args():
     # 单视频命令模式（每条内部用 | 分隔）
     ap.add_argument("--videos", type=str, nargs="+", default=[
         "--input|E:/Git/qav1/workspace/park_mobile_1920x1080_24.yuv|--input-res|1920x1080|--frames|0|"
-        "--o|E:/out/demo.ivf|--csv|E:/out/demo.csv|--bitrate|2125|--rc-mode|1|--pass|2|"
-        "--stat-in|./pass1.log|--stat-out|E:/Git/qav1/workspace/demo_pass2.log|"
+        "--o|./demo.ivf|--csv|./demo.csv|--bitrate|2125|--rc-mode|1|--pass|2|"
+        "--stat-in|./pass1.log|--stat-out|./demo_pass2.log|"
         "--score-max|50.5|--score-avg|40.5|--score-min|38.5|--fps|24|--preset|1|"
         "--keyint|225|--bframes|15|--threads|1|--parallel-frames|1"
     ])

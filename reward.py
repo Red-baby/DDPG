@@ -128,9 +128,9 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
         ref_psnr_avg   = float(_float(mg_ctx.get("ref_psnr_avg",   rq_meta.get("ref_psnr_avg",   0.0))))
         # λ来源：mg_ctx -> rq_meta -> cfg 初值
         lambda_b = float(_float(mg_ctx.get("lambda_b",
-                  rq_meta.get("lambda_b", getattr(cfg, "lag_b_init", 0.0)))))
+                          rq_meta.get("lambda_b", getattr(cfg, "lag_init_b", 0.0)))))
         lambda_q = float(_float(mg_ctx.get("lambda_q",
-                  rq_meta.get("lambda_q", getattr(cfg, "lag_q_init", 0.0)))))
+                          rq_meta.get("lambda_q", getattr(cfg, "lag_init_q", 0.0)))))
 
         if ref_bits_total > 0.0:
             used_before = float(_float(rq_meta.get("mg_used_before", 0.0)))
@@ -140,20 +140,48 @@ def compute_reward(cfg, fb: dict, rq_meta: dict,
             tol_b = float(getattr(cfg, "ref_bits_tol", 0.10))
             c_b = max(0.0, abs(rho - 1.0) - tol_b)
 
-            frames_so_far = int(_int(mg_ctx.get("frames_so_far", rq_meta.get("frames_so_far", 0))))
-            psnr_sum_prev = float(_float(rq_meta.get("mg_avg_psnr_so_far", -1.0)))
-            if psnr_sum_prev >= 0.0 and frames_so_far > 0:
-                avg_rl = (psnr_sum_prev * frames_so_far + psnr) / (frames_so_far + 1)
+            # --- 带宽区间（优先用 band，若未配置则退化到 tol） ---
+            low = float(getattr(cfg, "rate_band_low", 1.0 - tol_b))
+            high = float(getattr(cfg, "rate_band_high", 1.0 + tol_b))
+            in_band = (rho >= low) and (rho <= high)
+
+            # —— 段均 PSNR（把“之前的均值 × 帧数 + 当前帧”合并）——
+            frames_so_far_pre = int(_int(rq_meta.get("frames_so_far", 0)))
+            avg_psnr_so_far = float(_float(rq_meta.get("mg_avg_psnr_so_far", -1.0)))
+            if frames_so_far_pre > 0 and avg_psnr_so_far >= 0.0:
+                avg_rl = (avg_psnr_so_far * frames_so_far_pre + psnr) / (frames_so_far_pre + 1)
             else:
+                # 这是该段第一帧进入末K窗口的情形，用本帧代替
                 avg_rl = psnr
 
-            # 质量项门控：硬门 or 软门（指数衰减）
-            if bool(getattr(cfg, "ref_gate_soften", False)):
-                tol_q = float(getattr(cfg, "ref_bits_tol_q", tol_b))
-                gate = math.exp(- max(0.0, abs(rho - 1.0) - tol_q) / max(1e-6, tol_q))
-                c_q = gate * max(0.0, ref_psnr_avg - avg_rl)
-            else:
-                c_q = 0.0 if abs(rho - 1.0) > tol_b else max(0.0, ref_psnr_avg - avg_rl)
+            # === 质量项：带内“守底线 + 主动拉优” ===
+            # 1) “守底线”：RL 低于参考 → 正代价（扣分），带外禁用或软门
+            c_q_def = max(0.0, ref_psnr_avg - avg_rl)
+            if not in_band:
+                if bool(getattr(cfg, "ref_gate_soften", False)):
+                    tol_q = float(getattr(cfg, "ref_bits_tol_q", tol_b))
+                    gate = math.exp(- max(0.0, abs(rho - 1.0) - tol_q) / max(1e-6, tol_q))
+                    c_q_def *= gate
+                else:
+                    c_q_def = 0.0
+
+            # 2) “主动拉优”：RL 高于参考 → 负代价（加分），仅带内生效
+            c_q_bonus = 0.0
+            if in_band and bool(getattr(cfg, "q_bonus_enable", True)):
+                q_adv = max(0.0, avg_rl - ref_psnr_avg)  # dB 裕量
+                q_adv = min(q_adv, float(getattr(cfg, "q_bonus_cap_db", 0.5)))
+                bonus = float(getattr(cfg, "q_bonus_gain", 0.25)) * q_adv
+
+                # 可选：越靠近上沿奖励越小，避免把 ρ 顶到 1.05
+                if bool(getattr(cfg, "q_bonus_gate_to_high", True)):
+                    span = max(1e-6, high - low)
+                    gate_h = max(0.0, (high - rho) / span)  # rho->high 时→0
+                    bonus *= gate_h
+
+                c_q_bonus = bonus
+
+            # 最终 c_q = “落后惩罚” - “超参考奖励”
+            c_q = c_q_def - c_q_bonus
 
             # 线性分摊权 w ∈ (1..K)/sum(1..K)
             denom = K * (K + 1) / 2.0
