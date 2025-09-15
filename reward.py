@@ -1,206 +1,52 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import math
 from typing import Dict
-from utils import _float, _int
 
-_INTERNAL: Dict[int, Dict[str, float]] = {}
-
-def _ctx_for_doc(rq_meta: dict) -> dict:
-    doc_id = int(_int(rq_meta.get("doc", -1)))
-    if doc_id not in _INTERNAL:
-        _INTERNAL[doc_id] = {
-            "global_psnr_ema": 0.0, "psnr_ema_mg": 0.0,
-            "prev_psnr": 0.0, "ud_db": 38.0,
-            "ema_abs_q": 0.0, "ema_abs_b": 0.0,
-            "mg_frame_idx": 0, "has_sc_in_mg": False,
-            "lambda_b": 0.0, "lambda_q": 0.0,
-            "ref_bits_total": 0.0, "ref_psnr_avg": 0.0,
-        }
-    return _INTERNAL[doc_id]
-
-def _huber_abs(x: float, d: float) -> float:
-    ax = abs(float(x)); d = float(max(1e-9, d))
-    return (0.5*(ax*ax)/d) if ax <= d else (ax - 0.5*d)
-
-def _psnr_to_utility(psnr_db: float) -> float:
-    return 10.0 ** (float(psnr_db) / 20.0)
-
-def compute_reward(cfg, fb: dict, rq_meta: dict,
-                   prev_psnr_cached: float = 0.0,
-                   mg_ctx: dict | None = None) -> float:
+def compute_reward_mg(cfg, fb: dict, ref: Dict[str, float]) -> float:
     """
-    逐帧：质量+平滑项（无预算/预计量）；末段：与 2-pass 的 Lagrange 代价（支持末K帧分摊）。
-    - 首帧不做“相邻帧梯度”惩罚（避免跨 miniGOP 惩罚）
-    - 跨 miniGOP 对齐：仅段首前K帧贴近全局EMA，可在场景切换时弱化/关闭
-    - 基础项先 clip/scale，再叠加末段代价（末段可不clip或另设较大clip）
+    MiniGOP reward:
+      - Keep bit_avg within [low*ref_bit_avg, high*ref_bit_avg]
+      - Keep vmaf_avg >= ref_vmaf_avg
+    Positive reward for higher VMAF, penalties for bit out-of-band or quality drop.
     """
-    # ---------- inputs ----------
-    psnr = float(_float(fb.get("psnr_y", fb.get("psnr", 0.0))))
-    bits = float(_float(fb.get("bits", 0.0)))
-    frames_left = int(_int(rq_meta.get("frames_left_mg", 1)))
-    mg_size = int(_int(rq_meta.get("mg_size", getattr(cfg, "mg_size", 16))))
-    start_of_mg = (frames_left == mg_size)
-    is_last_frame = (frames_left == 1)
+    bit_avg   = float(fb.get("bit_avg", 0.0) or 0.0)
+    vmaf_avg  = float(fb.get("vmaf_avg", 0.0) or 0.0)
+    ref_bavg  = float(ref.get("bit_avg", 0.0) or 0.0)
+    ref_vavg  = float(ref.get("vmaf_avg", 0.0) or 0.0)
 
-    # 帧/段级 SC 标志
-    is_sc_frame   = int(_int(rq_meta.get("scene_cut", rq_meta.get("is_scene_cut", 0)))) != 0
-    is_sc_mg_meta = bool(rq_meta.get("scene_mg", rq_meta.get("is_sc_mg", False)))
+    low  = float(getattr(cfg, "rate_band_low",  0.90))
+    high = float(getattr(cfg, "rate_band_high", 1.05))
 
-    # ---------- context ----------
-    if mg_ctx is None:
-        mg_ctx = _ctx_for_doc(rq_meta)
-    mg_ctx["mg_size"] = mg_size
-
-    # ---------- Quality term: Nash log-utility 或线性差 ----------
-    psnr_min_db = float(getattr(cfg, "psnr_min_db", 38.0))
-    ud_db = float(mg_ctx.get("ud_db", psnr_min_db))
-    beta_ud = float(getattr(cfg, "ud_ema_beta", 0.90))
-    ud_db = beta_ud * ud_db + (1.0 - beta_ud) * psnr
-    mg_ctx["ud_db"] = ud_db
-
-    if bool(getattr(cfg, "use_nash", True)):
-        U  = _psnr_to_utility(psnr)
-        Ud = _psnr_to_utility(ud_db)
-        barg = float(getattr(cfg, "nash_scale", 1.0)) * math.log(max(U - Ud, float(getattr(cfg, "nash_eps", 1e-6))))
+    # bits ratio
+    if ref_bavg <= 0.0:
+        rho = 1.0
     else:
-        barg = float(getattr(cfg, "linq_scale", 1.0)) * (psnr - ud_db)
+        rho = bit_avg / max(1e-6, ref_bavg)
 
-    # ---------- smoothing: intra-EMA ----------
-    local_ema = float(mg_ctx.get("psnr_ema_mg", psnr))
-    beta_local = float(getattr(cfg, "smooth_ema_beta", 0.90))
-    delta_local = float(getattr(cfg, "smooth_huber_delta", 0.50))
-    local_ema = beta_local * local_ema + (1.0 - beta_local) * psnr
-    mg_ctx["psnr_ema_mg"] = local_ema
-    w_smooth = float(getattr(cfg, "w_smooth", 0.35))
-    smooth_pen = - w_smooth * _huber_abs(psnr - local_ema, delta_local)
+    # penalties for band violation
+    k_b = float(getattr(cfg, "mg_bits_penalty_gain", 2.0))
+    pen_b = 0.0
+    if rho < low:
+        pen_b = (low - rho) * k_b
+    elif rho > high:
+        pen_b = (rho - high) * k_b
 
-    # ---------- smoothing: adjacent gradient（首帧不惩罚、不跨mg） ----------
-    if start_of_mg:
-        prev_psnr = psnr
-        mg_ctx["mg_frame_idx"] = 1
-        mg_ctx["has_sc_in_mg"] = False
+    # quality reward (symmetric)
+    kq_pos = float(getattr(cfg, "mg_vmaf_gain_pos", 0.20))
+    kq_neg = float(getattr(cfg, "mg_vmaf_gain_neg", 0.30))
+    dv = vmaf_avg - ref_vavg
+    if dv >= 0:
+        rew_q = dv * kq_pos
     else:
-        prev_psnr = float(mg_ctx.get("prev_psnr", prev_psnr_cached))
-        mg_ctx["mg_frame_idx"] = int(_int(mg_ctx.get("mg_frame_idx", 1))) + 1
+        rew_q = dv * kq_neg  # negative
 
-    if is_sc_frame:
-        mg_ctx["has_sc_in_mg"] = True
-    has_sc_in_mg = bool(mg_ctx.get("has_sc_in_mg", False) or is_sc_mg_meta)
+    r = rew_q - pen_b
 
-    mg_ctx["prev_psnr"] = psnr
+    # optional terminal scaling
+    if int(fb.get("gop_end", fb.get("gopend", 0)) or 0) == 1:
+        r *= float(getattr(cfg, "end_penalty_scale", 1.0))
 
-    delta_g = float(getattr(cfg, "grad_huber_delta", 0.70))
-    w_grad  = float(getattr(cfg, "w_grad", 0.20))
-    sc_grad_amp = float(getattr(cfg, "sc_grad_amp", 0.80))
-    grad_pen = - (1.0 + (sc_grad_amp if has_sc_in_mg else 0.0)) \
-               * w_grad * _huber_abs(psnr - prev_psnr, delta_g)
-
-    # ---------- inter-MG alignment（段首前K帧贴全局EMA，SC时可弱化/关闭） ----------
-    inter_pen = 0.0
-    if bool(getattr(cfg, "inter_smooth_enable", True)):
-        g_prev = float(mg_ctx.get("global_psnr_ema", 0.0))
-        if g_prev <= 0.0:
-            g_prev = psnr
-        mg_idx = int(_int(mg_ctx.get("mg_frame_idx", 1)))
-        delta_inter = float(getattr(cfg, "inter_smooth_huber_delta", 0.80))
-        w_inter = float(getattr(cfg, "w_inter", 0.15))
-        if has_sc_in_mg or is_sc_frame:
-            w_inter *= float(getattr(cfg, "inter_sc_scale", 0.0))  # 默认0=关闭
-        inter_K = int(getattr(cfg, "inter_smooth_first_k", 3))
-        if mg_idx <= max(1, inter_K):
-            inter_pen = - w_inter * _huber_abs(psnr - g_prev, delta_inter)
-        beta_g = float(getattr(cfg, "inter_global_ema_beta", 0.98))
-        mg_ctx["global_psnr_ema"] = beta_g * g_prev + (1.0 - beta_g) * psnr
-
-    # ---------- base reward（仅基础项做小范围clip/scale） ----------
-    r_base = barg + smooth_pen + grad_pen + inter_pen
-    base_clip  = float(getattr(cfg, "reward_clip_base", 1.5))
-    base_scale = float(getattr(cfg, "reward_scale_base", 1.0))
-    r = max(-base_clip, min(base_clip, r_base)) * base_scale
-
-    # ---------- 2-pass Lagrangian penalty（末K帧分摊，可放大、可不clip） ----------
-    K = int(getattr(cfg, "end_span_k", 3))  # 末K帧分摊；K<=0则等同仅末帧
-    if K <= 0:
-        K = 1
-    if frames_left <= K:
-        ref_bits_total = float(_float(mg_ctx.get("ref_bits_total", rq_meta.get("ref_bits_total", 0.0))))
-        ref_psnr_avg   = float(_float(mg_ctx.get("ref_psnr_avg",   rq_meta.get("ref_psnr_avg",   0.0))))
-        # λ来源：mg_ctx -> rq_meta -> cfg 初值
-        lambda_b = float(_float(mg_ctx.get("lambda_b",
-                          rq_meta.get("lambda_b", getattr(cfg, "lag_init_b", 0.0)))))
-        lambda_q = float(_float(mg_ctx.get("lambda_q",
-                          rq_meta.get("lambda_q", getattr(cfg, "lag_init_q", 0.0)))))
-
-        if ref_bits_total > 0.0:
-            used_before = float(_float(rq_meta.get("mg_used_before", 0.0)))
-            used_after  = used_before + bits
-            rho = used_after / max(1.0, ref_bits_total)
-
-            tol_b = float(getattr(cfg, "ref_bits_tol", 0.10))
-            c_b = max(0.0, abs(rho - 1.0) - tol_b)
-
-            # --- 带宽区间（优先用 band，若未配置则退化到 tol） ---
-            low = float(getattr(cfg, "rate_band_low", 1.0 - tol_b))
-            high = float(getattr(cfg, "rate_band_high", 1.0 + tol_b))
-            in_band = (rho >= low) and (rho <= high)
-
-            # —— 段均 PSNR（把“之前的均值 × 帧数 + 当前帧”合并）——
-            frames_so_far_pre = int(_int(rq_meta.get("frames_so_far", 0)))
-            avg_psnr_so_far = float(_float(rq_meta.get("mg_avg_psnr_so_far", -1.0)))
-            if frames_so_far_pre > 0 and avg_psnr_so_far >= 0.0:
-                avg_rl = (avg_psnr_so_far * frames_so_far_pre + psnr) / (frames_so_far_pre + 1)
-            else:
-                # 这是该段第一帧进入末K窗口的情形，用本帧代替
-                avg_rl = psnr
-
-            # === 质量项：带内“守底线 + 主动拉优” ===
-            # 1) “守底线”：RL 低于参考 → 正代价（扣分），带外禁用或软门
-            c_q_def = max(0.0, ref_psnr_avg - avg_rl)
-            if not in_band:
-                if bool(getattr(cfg, "ref_gate_soften", False)):
-                    tol_q = float(getattr(cfg, "ref_bits_tol_q", tol_b))
-                    gate = math.exp(- max(0.0, abs(rho - 1.0) - tol_q) / max(1e-6, tol_q))
-                    c_q_def *= gate
-                else:
-                    c_q_def = 0.0
-
-            # 2) “主动拉优”：RL 高于参考 → 负代价（加分），仅带内生效
-            c_q_bonus = 0.0
-            if in_band and bool(getattr(cfg, "q_bonus_enable", True)):
-                q_adv = max(0.0, avg_rl - ref_psnr_avg)  # dB 裕量
-                q_adv = min(q_adv, float(getattr(cfg, "q_bonus_cap_db", 0.5)))
-                bonus = float(getattr(cfg, "q_bonus_gain", 0.25)) * q_adv
-
-                # 可选：越靠近上沿奖励越小，避免把 ρ 顶到 1.05
-                if bool(getattr(cfg, "q_bonus_gate_to_high", True)):
-                    span = max(1e-6, high - low)
-                    gate_h = max(0.0, (high - rho) / span)  # rho->high 时→0
-                    bonus *= gate_h
-
-                c_q_bonus = bonus
-
-            # 最终 c_q = “落后惩罚” - “超参考奖励”
-            c_q = c_q_def - c_q_bonus
-
-            # 线性分摊权 w ∈ (1..K)/sum(1..K)
-            denom = K * (K + 1) / 2.0
-            w_k = (K - frames_left + 1) / denom
-            end_penalty_scale = float(getattr(cfg, "end_penalty_scale", 1.0))
-            penalty = end_penalty_scale * w_k * (lambda_b * c_b + lambda_q * c_q)
-
-            if bool(getattr(cfg, "end_penalty_no_clip", True)):
-                r = r - penalty
-            else:
-                end_clip = float(getattr(cfg, "reward_clip_end", 4.0))
-                r = max(-end_clip, min(end_clip, r - penalty))
-
-    # ---------- final guard clip（宽边界，防数值爆） ----------
-    final_clip = float(getattr(cfg, "reward_clip_final", 8.0))
-    r = max(-final_clip, min(final_clip, r))
-    return float(r)
-
-
-# 兼容旧名
-def compute_reward_dual(*args, **kwargs):
-    return compute_reward(*args, **kwargs)
+    # clip + global scale
+    r = max(-float(getattr(cfg, "reward_clip", 3.0)),
+            min(float(getattr(cfg, "reward_clip", 3.0)), r))
+    return r * float(getattr(cfg, "reward_scale", 1.0))

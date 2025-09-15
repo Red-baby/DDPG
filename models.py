@@ -14,56 +14,42 @@ class ResBlock(nn.Module):
         h = F.gelu(self.fc1(x))
         h = self.drop(h)
         h = self.fc2(h)
-        return self.ln(x + h)
+        h = self.ln(h)
+        return F.gelu(x + h)
 
-class FilmGate(nn.Module):
-    def __init__(self, z_dim: int, in_dim: int, hidden: int):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(z_dim, hidden), nn.GELU(),
-            nn.Linear(hidden, in_dim*2)
-        )
-    def forward(self, h, z):
-        gam_beta = self.fc(z)
-        C = h.size(1)
-        gamma, beta = gam_beta[:, :C], gam_beta[:, C:]
-        return h * (1 + gamma) + beta
-
-class ActorNet(nn.Module):
-    def __init__(self, state_dim: int, hidden: int = 512, depth: int = 4,
-                 cond_idx: tuple[int, ...] = (7, 8, 9, 10, 11, 12)):
+class ActorNetMulti(nn.Module):
+    """
+    Actor: maps state->[0,1]^A (A=MG_MAX). We map to absolute QP in runner.
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden=512, depth=4, pdrop=0.1):
         super().__init__()
         self.fc_in = nn.Linear(state_dim, hidden)
-        self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=0.1) for _ in range(depth)])
+        self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=pdrop) for _ in range(depth)])
         self.ln = nn.LayerNorm(hidden)
-        self.cond_idx = cond_idx
-        z_dim = (len(cond_idx) if cond_idx is not None else state_dim)
-        self.film = FilmGate(z_dim, hidden, hidden)
-        self.fc_out = nn.Linear(hidden, 1)
+        self.fc_out = nn.Linear(hidden, action_dim)
     def forward(self, s):
         h = F.gelu(self.fc_in(s))
-        for blk in self.blocks:
-            h = blk(h)
+        for b in self.blocks:
+            h = b(h)
         h = self.ln(h)
-        z = s[:, list(self.cond_idx)] if self.cond_idx else s
-        h = self.film(h, z)
-        a = torch.sigmoid(self.fc_out(h))
-        return a  # [B,1]
+        a = torch.sigmoid(self.fc_out(h))  # [B, A] in [0,1]
+        return a
 
-class CriticNet(nn.Module):
-    def __init__(self, state_dim: int, hidden: int = 512, depth: int = 3):
+class CriticNetMulti(nn.Module):
+    """
+    Critic: Q(s,a) with a in [0,1]^A (concatenate then MLP).
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden=512, depth=4, pdrop=0.1):
         super().__init__()
-        self.fc_s = nn.Linear(state_dim, hidden)
-        self.fc_a = nn.Linear(1, hidden)
-        self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=0.1) for _ in range(depth)])
+        self.fc_in = nn.Linear(state_dim + action_dim, hidden)
+        self.blocks = nn.ModuleList([ResBlock(hidden, hidden*2, pdrop=pdrop) for _ in range(depth)])
         self.ln = nn.LayerNorm(hidden)
         self.fc_out = nn.Linear(hidden, 1)
     def forward(self, s, a01):
-        hs = F.gelu(self.fc_s(s))
-        ha = F.gelu(self.fc_a(a01))
-        h = hs + ha
-        for blk in self.blocks:
-            h = blk(h)
+        x = torch.cat([s, a01], dim=-1)
+        h = F.gelu(self.fc_in(x))
+        for b in self.blocks:
+            h = b(h)
         h = self.ln(h)
         q = self.fc_out(h)
         return q

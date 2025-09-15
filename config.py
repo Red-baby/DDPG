@@ -1,136 +1,72 @@
 # -*- coding: utf-8 -*-
+"""
+config.py — 全量可直接替换版本
+
+说明：
+- 适配 miniGOP 向量动作（一次性输出当前 miniGOP 所有帧的 QP）。
+- 与 main.py / io_runner.py / agent.py / models.py 兼容。
+- 若需覆盖默认值，可在命令行或外部脚本里按需修改对应字段。
+"""
+
 from dataclasses import dataclass
 import torch
 
+
 @dataclass
 class Config:
-    # ===== 基本运行 =====
-    rl_dir: str = r"./rl_io"
-    mode: str = "train"                  # "train" | "val" | "infer"
+    # ===== 基本设置 =====
+    rl_dir: str = r"./rl_io"                     # 与编码器端 rl_set_dir 一致
+    mode: str = "train"                          # "train" | "val" | "infer"
     seed: int = 2025
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ===== 编码器可执行路径（main.py 可覆盖）=====
-    encoder_path: str = r"./qav1enc.exe"
+    # ===== 编码器相关 =====
+    encoder_path: str = r"./qav1enc.exe"         # 可被 main.py --encoder 覆盖
+    fps: int = 24                                # 仅用于日志/统计（kbps 等）
 
-    # ===== 切换：单视频命令 vs 数据集模式 =====
-    use_dataset: bool = False            # True=数据集模式；False=单视频模式
+    # ===== miniGOP 设置 =====
+    mg_size: int = 16                            # 常规 miniGOP 显示帧数（不足用“复制末帧”补齐为 16）
+    qp_min: int = 0                              # 绝对 QP 下界（含）
+    qp_max: int = 255                            # 绝对 QP 上界（含）
 
-    # ===== QP 边界 =====
-    qp_min: int = 80
-    qp_max: int = 200
-    delta_qp_max: float = 20.0
-    fps: int = 30
+    # ===== Actor/Critic 网络与优化器 =====
+    hidden_dim: int = 512                        # 主干隐藏维度
+    depth: int = 4                               # ResBlock 层数（越大越强但更慢）
+    lr_actor: float = 1e-4
+    lr_critic: float = 1e-4
+    gamma: float = 0.99                          # 折扣因子
+    tau: float = 0.005                           # 软更新系数 Polyak
+    policy_noise: float = 0.05                   # 目标策略噪声幅度（动作空间 [0,1]）
+    noise_clip: float = 0.20                     # 目标策略噪声裁剪
+    policy_delay: int = 2                        # TD3 策略延迟更新步数
+    batch_size: int = 64
+    replay_size: int = 20000
+    explore_eps: float = 0.10                    # 训练时 Actor 输出加性高斯噪声强度
 
-    # ===== 算法选择 =====
-    algo: str = "td3_lag"               # "td3_lag" | "td3"
-    # TD3/TD3-Lagrangian 超参
-    gamma: float = 0.98
-    tau: float = 0.005
-    actor_lr: float = 1e-4
-    critic_lr: float = 2e-4
-    batch_size: int = 32
-    replay_size: int = 1000
-    warmup_steps: int = 500
-    train_steps_per_env_step: int = 4
-    policy_noise: float = 0.10
-    noise_clip: float = 0.20
-    policy_delay: int = 2
-    expl_noise_std: float = 0.15
-    action_eps_train: float = 0.10
-    action_eps_infer: float = 0.00
-    target_discretize: bool = True
+    # ===== 训练节奏与日志 =====
+    train_steps_per_env_step: int = 1            # 每次收到一个 FB 做几步训练
+    loss_ema_beta: float = 0.2                   # 打印时的损失 EMA 系数
+    print_every_sec: float = 2.0                 # 控制台打印间隔（秒）
+    ckpt_prefix: str = "ckpt"                    # 保存/加载时的前缀（如需）
 
-    # ===== Lagrangian：miniGOP 末端约束（对照 2-pass）=====
-    ref_bits_tol: float = 0.05          # 允许 ±10%
-    lag_b_init: float = 0.0
-    lag_eta_b:  float = 1.5
-    lag_eta_q:  float = 0.5
-    lag_b_max:  float = 50.0
-    lag_q_max:  float = 50.0
-    end_penalty_scale: float = 2.0
-    end_span_k:  int = 6
-    end_penalty_no_clip: bool = True
-    # ===== Reward 形状项（逐帧）=====
-    psnr_min_db: float = 38.0
-    nash_eps: float = 1e-6
-    ud_ema_beta: float = 0.90
+    # ===== 回报函数（miniGOP 级）=====
+    # 约束1：bit_avg ∈ [rate_band_low, rate_band_high] × ref_bit_avg
+    rate_band_low: float = 0.90
+    rate_band_high: float = 1.05
+    mg_bits_penalty_gain: float = 2.0            # 码率越界的惩罚斜率
 
-    smooth_ema_beta: float = 0.90
-    smooth_huber_delta: float = 0.50
-    w_smooth: float = 0.35
+    # 约束2：vmaf_avg ≥ ref_vmaf_avg
+    mg_vmaf_gain_pos: float = 0.20               # VMAF 高于参考的奖励斜率
+    mg_vmaf_gain_neg: float = 0.30               # VMAF 低于参考的惩罚斜率（通常更大）
+    end_penalty_scale: float = 1.0               # 在 episode 终止（gop_end==1）时放大奖惩
+    reward_clip: float = 3.0                     # 奖励裁剪阈值（对称）
+    reward_scale: float = 1.0                    # 全局缩放
 
-    grad_huber_delta: float = 0.70
-    w_grad: float = 0.20
-    sc_grad_amp: float = 0.80
-
-    inter_smooth_enable: bool = True
-    inter_global_ema_beta: float = 0.98
-    inter_smooth_first_k: int = 3
-    inter_smooth_huber_delta: float = 0.80
-    w_inter: float = 0.15
-    inter_gate_sc: float = 0.0
-
-    use_per_frame_lambda_bits: bool = False
-    lambda_init: float = 1e-3
-    lambda_lo: float = 1e-6
-    lambda_hi: float = 1e+2
-    lambda_eta: float = 0.5
-    bit_gate_hi: float = 1.0
-    bit_gate_lo: float = 0.25
-    avg_psnr_ema_beta: float = 0.98
-    psnr_target_db: float = 40.5
-    min_bpf: float = 500.0
-
-    mg_tol: float = 0.05
-    mg_huber_delta: float = 0.05
-    mg_early_amp: float = 1.0
-    mg_early_exp: float = 0.9
-
-    sc_p_quality_boost: float = 0.80
-    sc_p_bit_gate: float = 0.60
-
-    reward_balance_auto: bool = True
-    reward_balance_momentum: float = 0.95
-    reward_balance_target_mag: float = 0.8
-    reward_clip: float = 1.5
-    reward_scale: float = 1.0
-    # 码率带宽（主约束）
-    rate_band_low = 0.90
-    rate_band_high = 1.05
-    # 质量“超参考”的奖励强度（带内才生效）
-    q_bonus_enable = True
-    q_bonus_gain = 0.25  # 奖励斜率，建议 0.15~0.35
-    q_bonus_cap_db = 0.5  # 单段最多以 0.5 dB 裕量计奖，防过强
-    q_bonus_gate_to_high = True  # ρ 越靠近上沿，奖励越弱，避免被推到 1.05 顶边
-
-    # 建议让 λq 初值>0，使奖励能起效（否则 λq=0 时“负 c_q”也乘成 0）
-    lag_q_init = 0.10
-    # ===== 安全层（QP 限幅与回退）=====
-    safety_layer_enable: bool = True
-    safety_slack: float = 1.05
-    safety_qp_step: int = 2
-
-    # ===== 2-pass 基线日志路径（main 会按 --stat-in 自动推导）=====
-    twopass_log_path: str = ""
-
-    # ===== 打印/日志 =====
-    print_every_sec: float = 2.0
-    loss_ema_beta: float = 0.20
-    metrics_csv: str = "epoch_metrics.csv"
-    encoder_log_to_file: bool = True
-    encoder_log_dir: str = "./logs/encoder"
+    # ===== 其它可选（兼容/备用）=====
+    delta_qp_max: int = 20                       # 若改为 ΔQP 方案时可复用（当前为绝对 QP 向量输出）
+    twopass_log_path: str = ""                   # 由 main.py/_run_one_video 自动推导并注入
+    # 是否把编码器的 stdout/stderr 打到控制台（True）还是丢弃（False）
     show_encoder_output: bool = False
+
+    # 仅 Windows 生效：是否隐藏编码器控制台窗口
     hide_encoder_console_window: bool = True
-    # config.py
-    use_nash: bool = True
-    nash_scale: float = 1.0
-    linq_scale: float = 1.0  # 关掉nash时，线性质量项的缩放
-
-    # ==== Reward 策略 ====
-    reward_variant: str = "mg_end_lagrange_only"  # 新增：逐帧仅形状项，末帧用 2-pass 对齐
-    use_budget_features_in_state: bool = False  # 新增：状态里屏蔽“预算/进度”等预计量
-
-    # （可选）miniGOP软预算项也关掉：只依赖2-pass
-    disable_mg_soft_budget_term: bool = True
-
