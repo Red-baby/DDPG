@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-import os, argparse, threading
-from typing import List
+import os, argparse, threading, re
+from typing import List, Dict, Tuple
 from config import Config
 from io_runner import RLRunner
 from encoder_proc import launch_encoder, start_monitor
 from dataset import add_dataset_args, build_cmds_from_dataset
+from baseline import TwoPassBaseline
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -25,7 +26,7 @@ def parse_args():
         "--o|./demo.ivf|--csv|./demo.csv|--bitrate|2125|--rc-mode|1|--pass|2|"
         "--stat-in|./pass1.log|--stat-out|./demo_pass2.log|"
         "--score-max|50.5|--score-avg|40.5|--score-min|38.5|--fps|24|--preset|1|"
-        "--keyint|225|--bframes|15|--threads|1|--parallel-frames|1"
+        "--keyint|225|--bframes|15|--threads|1|--print-vmaf|1|--parallel-frames|1"
     ])
 
     # 注入数据集相关参数（不使用 manifest）
@@ -48,6 +49,66 @@ def _infer_twopass_from_stat_in(stat_in: str) -> str:
         return ""
     # 只把 pass1 替换成 pass2；路径其它部分不动
     return stat_in.replace("pass1", "pass2")
+
+def _get_epoch_stats(cfg: Config, twopass_log_path: str, runner: RLRunner) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    获取当前epoch的统计信息：
+    - 2-pass日志的总平均VMAF和比特率
+    - RL控制的编码统计信息（直接从runner中获取累积数据）
+    """
+    # 获取2-pass统计信息
+    two_pass_stats = {"vmaf_avg": 0.0, "bit_avg": 0.0, "count": 0}
+    if twopass_log_path and os.path.exists(twopass_log_path):
+        try:
+            baseline = TwoPassBaseline(twopass_log_path)
+            # 获取所有POC的统计信息，排除I/K/O帧
+            all_pocs = []
+            for poc, rec in baseline.map.items():
+                frame_type = (rec.get("type", "") or "").upper()
+                if frame_type not in ("I", "K", "O"):  # 只统计P/B帧
+                    all_pocs.append(poc)
+            
+            if all_pocs:
+                two_pass_stats = baseline.mg_stats_from_pocs(all_pocs)
+        except Exception as e:
+            print(f"[STATS] Error parsing 2-pass log: {e}")
+    
+    # 直接从runner获取RL统计信息（reward计算时累积的数据）
+    rl_stats = runner.get_epoch_stats()
+    
+    print(f"[STATS] RL stats from reward accumulation: {rl_stats['mg_count']} miniGOPs processed")
+    
+    # 显示当前epoch的env_steps增量俥调试
+    current_env_steps = getattr(runner.agent, 'total_env_steps', 0) - runner.epoch_start_env_steps
+    print(f"[STATS] Current epoch env_steps: {current_env_steps}")
+    
+    return two_pass_stats, rl_stats
+
+def _print_epoch_stats(epoch_id: int, two_pass_stats: Dict[str, float], rl_stats: Dict[str, float]):
+    """
+    打印epoch统计信息
+    """
+    print(f"=== Epoch {epoch_id} Statistics ===")
+    print(f"2-pass baseline:")
+    print(f"  - Average VMAF: {two_pass_stats.get('vmaf_avg', 0.0):.2f}")
+    print(f"  - Average Bits: {two_pass_stats.get('bit_avg', 0.0):.2f}")
+    print(f"  - Frame count:  {two_pass_stats.get('count', 0)}")
+    
+    print(f"RL controlled encoding:")
+    print(f"  - Average VMAF: {rl_stats.get('vmaf_avg', 0.0):.2f}")
+    print(f"  - Average Bits: {rl_stats.get('bit_avg', 0.0):.2f}")
+    print(f"  - MiniGOP count: {rl_stats.get('mg_count', 0)}")
+    
+    # 计算差异
+    vmaf_diff = rl_stats.get('vmaf_avg', 0.0) - two_pass_stats.get('vmaf_avg', 0.0)
+    bit_diff = rl_stats.get('bit_avg', 0.0) - two_pass_stats.get('bit_avg', 0.0)
+    bit_ratio = rl_stats.get('bit_avg', 0.0) / two_pass_stats.get('bit_avg', 1.0) if two_pass_stats.get('bit_avg', 0.0) > 0 else 0.0
+    
+    print(f"Comparison:")
+    print(f"  - VMAF difference: {vmaf_diff:+.2f}")
+    print(f"  - Bits difference: {bit_diff:+.2f}")
+    print(f"  - Bits ratio: {bit_ratio:.3f}x")
+    print("=" * 40)
 
 def _run_one_video(runner: RLRunner, cfg: Config, argv: List[str], epoch_id: int, epoch_total: int):
     # 自动推导 2-pass 基线
@@ -73,6 +134,10 @@ def _run_one_video(runner: RLRunner, cfg: Config, argv: List[str], epoch_id: int
     stop_evt = threading.Event()
     _ = start_monitor(enc, cfg, runner, stop_evt)
     runner.serve_loop(stop_evt)
+    
+    # 编码完成后打印统计信息
+    two_pass_stats, rl_stats = _get_epoch_stats(cfg, tp_path, runner)
+    _print_epoch_stats(epoch_id, two_pass_stats, rl_stats)
 
 def main():
     args = parse_args()

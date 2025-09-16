@@ -58,6 +58,29 @@ class RLRunner:
         self.epoch_idx = 0; self.epoch_total = 0
         self.loss_ema_a = None; self.loss_ema_c = None
         self._ep_updates = 0
+        
+        # ===== 实时统计累积 =====
+        self.epoch_start_env_steps = 0  # 初始化
+        self.reset_epoch_stats()
+        
+    def reset_epoch_stats(self):
+        """重置当前epoch的统计信息"""
+        self.epoch_stats = {
+            "total_vmaf": 0.0,
+            "total_bits": 0.0, 
+            "mg_count": 0,
+            "vmaf_avg": 0.0,
+            "bit_avg": 0.0
+        }
+        # 记录当前epoch开始时的env_steps，用于计算当前epoch的增量
+        self.epoch_start_env_steps = getattr(self.agent, 'total_env_steps', 0)
+    
+    def get_epoch_stats(self) -> Dict[str, float]:
+        """获取当前epoch的统计信息"""
+        if self.epoch_stats["mg_count"] > 0:
+            self.epoch_stats["vmaf_avg"] = self.epoch_stats["total_vmaf"] / self.epoch_stats["mg_count"]
+            self.epoch_stats["bit_avg"] = self.epoch_stats["total_bits"] / self.epoch_stats["mg_count"]
+        return self.epoch_stats.copy()
 
     # --------------------- public API ---------------------
     def set_epoch(self, idx: int, total: int, twopass_log_path: Optional[str] = None):
@@ -65,6 +88,8 @@ class RLRunner:
         if twopass_log_path:
             self.cfg.twopass_log_path = twopass_log_path
         self._maybe_load_baseline(getattr(self.cfg, "twopass_log_path", ""))
+        # 重置统计信息
+        self.reset_epoch_stats()
 
     # --------------------- helpers ------------------------
     def _maybe_load_baseline(self, path: str):
@@ -78,11 +103,50 @@ class RLRunner:
             self.baseline = None
 
     def _write_qp_file(self, rq_path: str, qps: List[int]):
+        """
+        原子写入 mg_XXXX.qp.txt，并立刻校验行数；打印调试信息，便于和编码器端日志对齐。
+        返回 (ok: bool, qp_path: str, n_lines: int)
+        """
         qp_path = rq_path.replace(".rq.json", ".qp.txt")
+        # 原子写：先写 .tmp，再 rename
+        tmp = qp_path + ".tmp"
+        payload = "\n".join(str(int(q)) for q in qps) + "\n"
         try:
-            safe_write_text(qp_path, "\n".join(str(int(q)) for q in qps) + "\n")
-        except PermissionError as e:
-            print(f"[RL][WARN] write qp failed: {e}")
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+            
+            # 在Windows上使用更安全的文件替换方法
+            import shutil
+            if os.path.exists(qp_path):
+                try:
+                    os.remove(qp_path)
+                except PermissionError:
+                    # 如果目标文件被占用，等待片刻再试
+                    import time
+                    time.sleep(0.1)
+                    if os.path.exists(qp_path):
+                        os.remove(qp_path)
+            
+            shutil.move(tmp, qp_path)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except Exception:
+                pass
+            print(f"[RL][WARN] write qp failed: {e} -> {qp_path}")
+            return False, qp_path, 0
+
+        # 复读校验（确保编码器不会读到半文件）
+        try:
+            with open(qp_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip() != ""]
+            n_lines = len(lines)
+        except Exception as e:
+            print(f"[RL][WARN] verify qp failed: {e} -> {qp_path}")
+            return False, qp_path, 0
+
+        #print(f"[RL][QP] wrote {n_lines} lines -> {os.path.abspath(qp_path)} | head: {lines[:min(4, n_lines)]}")
+        return (n_lines == len(qps)), qp_path, n_lines
 
     def _compute_ref_avgs(self, poc_list: List[int]) -> Dict[str, float]:
         """
@@ -128,11 +192,18 @@ class RLRunner:
 
             # action: per-frame QP absolute (vector)
             explore = (self.cfg.mode == "train")
-            a01_vec, qp_vec = self.agent.select_action_vector(s, mg_size=mg_size,
-                                                              qp_min=self.cfg.qp_min, qp_max=self.cfg.qp_max,
-                                                              explore=explore)
+            a01_vec, qp_vec = self.agent.select_action_vector(
+                s, mg_size=mg_size,
+                qp_min=self.cfg.qp_min, qp_max=self.cfg.qp_max,
+                base_q_vec=np.array(meta.get("base_q_list", []), dtype=np.float32),
+                explore=explore
+            )
+
             # write exactly mg_size integers
-            self._write_qp_file(rq_path, list(map(int, qp_vec[:mg_size])))
+            qps_to_write = list(map(int, qp_vec[:mg_size + 1]))
+            ok, qp_path, n_lines = self._write_qp_file(rq_path, qps_to_write)
+            if not ok:
+                print(f"[RL][WARN] mg_id={mg_id} write-count-mismatch exp={len(qps_to_write)} got={n_lines}")
 
             # stage pending transition
             self.pending[mg_id] = PendingMG(
@@ -170,6 +241,16 @@ class RLRunner:
 
             # reference averages
             ref = self._compute_ref_avgs(pend.poc_list or [])
+            
+            # 在reward计算时直接累积统计数据
+            fb_vmaf = float(_float(fb.get("vmaf_avg", 0.0)))
+            fb_bits = float(_float(fb.get("bit_avg", 0.0)))
+            
+            # 只统计有效的VMAF和比特率数据
+            if fb_vmaf > 0.0 and fb_bits > 0.0:
+                self.epoch_stats["total_vmaf"] += fb_vmaf
+                self.epoch_stats["total_bits"] += fb_bits
+                self.epoch_stats["mg_count"] += 1
 
             # reward
             r = compute_reward_mg(self.cfg, fb, ref)
@@ -226,7 +307,7 @@ class RLRunner:
                 if self.loss_ema_a is not None and self.loss_ema_c is not None:
                     loss_str = f" | loss_a={self.loss_ema_a:.4f} loss_c={self.loss_ema_c:.4f}"
                 print(f"[RL] epoch {self.epoch_idx}/{self.epoch_total} | steps env/train: "
-                      f"{getattr(self.agent, 'total_env_steps', 0)}/{getattr(self.agent, 'total_train_steps', 0)} "
+                      f"{getattr(self.agent, 'total_env_steps', 0) - self.epoch_start_env_steps}/{getattr(self.agent, 'total_train_steps', 0)} "
                       f"| replay={len(getattr(self.agent, 'buf', []))}{loss_str}")
                 last_print = now
 

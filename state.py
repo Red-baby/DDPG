@@ -128,7 +128,6 @@ def build_mg_state(rq: Dict[str, Any], cfg) -> tuple[torch.Tensor, Dict[str, Any
         "mg_id": int(_int(rq.get("mg_id", -1))),
         "mg_size": mg_size,
         "mg_bits_tgt": float(_float(rq.get("mg_bits_tgt", 0.0))),
-        "gop_end_hint": int(_int(rq.get("gop_end", rq.get("gopend", 0)))),
         "base_q_list": [int(b) for b in base_qs[:MG_MAX]],
     }
     # 仅返回前 mg_size 个 POC，用于 2-pass 参考均值统计

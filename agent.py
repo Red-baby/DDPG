@@ -75,6 +75,8 @@ class TD3Multi:
         self.total_env_steps = 0
         self.total_train_steps = 0
 
+    # ==== in agent.py (类里) ====
+
     def _act_a01(self, s: torch.Tensor, explore: bool) -> torch.Tensor:
         """
         Get action in [0,1]^action_dim. Add exploration noise if training.
@@ -90,21 +92,53 @@ class TD3Multi:
                 a01 = (a01 + noise).clamp(0.0, 1.0)
         return a01  # [action_dim]
 
-    def select_action_vector(self, s: torch.Tensor, mg_size: int, qp_min: int, qp_max: int, explore: bool):
+    def _map_around_base(self, a01: torch.Tensor, base_q: torch.Tensor, qp_min: int, qp_max: int) -> torch.Tensor:
+        """
+        把 a01∈[0,1] 映射成以 base_q 为中心的绝对 QP：
+          a01=0.5 -> ΔQP = 0（不变）
+          a01<0.5 -> 负向调整；a01>0.5 -> 正向调整
+          ΔQP 最大幅度由 cfg.delta_qp_max 控制（默认 20）
+        """
+        delta_max = int(getattr(self.cfg, "delta_qp_max", 20))
+        # a01∈[0,1] -> [-1, +1] -> 乘以 Δmax -> 四舍五入成整数 ΔQP
+        delta = torch.round((a01 - 0.5) * 2.0 * delta_max)
+        qps = base_q.to(delta) + delta
+        qps = torch.clamp(qps, min=qp_min, max=qp_max).to(torch.int32)
+        return qps
+
+    def select_action_vector(
+            self,
+            s: torch.Tensor,
+            mg_size: int,
+            qp_min: int,
+            qp_max: int,
+            base_q_vec=None,  # <--- 新增：来自 RQ 的每帧 base_q（长度=MG_MAX）
+            explore: bool = True,
+    ):
         """
         Return:
           a01_vec: np.ndarray [action_dim] in [0,1]
-          qp_vec : np.ndarray [action_dim] absolute QP mapped to [qp_min, qp_max]
+          qp_vec : np.ndarray [action_dim] absolute QP mapped around base_q
+        说明：
+          - 只写回前 mg_size 个 QP 到 .qp.txt；后面位置（补齐帧）不会被编码器使用
+          - 若未提供 base_q_vec，则退化为以区间中点为基准的映射
         """
-        a01 = self._act_a01(s, explore=explore)
-        # map [0,1] -> [qp_min, qp_max]
-        qps = (a01 * (qp_max - qp_min) + qp_min).round().to(torch.int32)
-        # keep vector length = action_dim; caller slices to mg_size
+        a01 = self._act_a01(s, explore=explore)  # [action_dim]
+        if base_q_vec is not None:
+            base = torch.tensor(base_q_vec, dtype=torch.float32)  # [action_dim]
+        else:
+            # 兜底：没有 base_q 时用区间中点
+            base_val = 0.5 * (float(qp_min) + float(qp_max))
+            base = torch.full_like(a01, base_val)
+
+        qps = self._map_around_base(a01, base, qp_min, qp_max)  # [action_dim] int32
         return a01.numpy(), qps.cpu().numpy()
 
     def train_step(self):
-        if len(self.buf) < max(128, self.batch_size):
+        warmup = int(getattr(self.cfg, "warmup_min_transitions", max(32, self.batch_size)))
+        if len(self.buf) < warmup:
             return None
+
         s, a01, r, s2, d = self.buf.sample(self.batch_size, self.device)
 
         # target action with clipped noise
