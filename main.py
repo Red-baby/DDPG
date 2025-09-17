@@ -84,7 +84,7 @@ def _get_epoch_stats(cfg: Config, twopass_log_path: str, runner: RLRunner) -> Tu
     
     return two_pass_stats, rl_stats
 
-def _print_epoch_stats(epoch_id: int, two_pass_stats: Dict[str, float], rl_stats: Dict[str, float]):
+def _print_epoch_stats(epoch_id: int, two_pass_stats: Dict[str, float], rl_stats: Dict[str, float], runner: RLRunner):
     """
     打印epoch统计信息
     """
@@ -108,7 +108,67 @@ def _print_epoch_stats(epoch_id: int, two_pass_stats: Dict[str, float], rl_stats
     print(f"  - VMAF difference: {vmaf_diff:+.2f}")
     print(f"  - Bits difference: {bit_diff:+.2f}")
     print(f"  - Bits ratio: {bit_ratio:.3f}x")
+    
+    # 添加episode return信息
+    if hasattr(runner, 'episode_returns') and len(runner.episode_returns) > 0:
+        returns = runner.episode_returns
+        print(f"Episode Returns:")
+        print(f"  - Total Episodes: {len(returns)}")
+        print(f"  - Latest Return: {returns[-1]:.4f}")
+        print(f"  - Average Return: {sum(returns)/len(returns):.4f}")
+        if len(returns) > 1:
+            print(f"  - Return Std: {(sum((x - sum(returns)/len(returns))**2 for x in returns) / len(returns))**0.5:.4f}")
+            
+        # 显示最近几个episode的return
+        recent_count = min(5, len(returns))
+        recent_returns = returns[-recent_count:]
+        print(f"  - Recent {recent_count} Returns: {', '.join(f'{r:.3f}' for r in recent_returns)}")
+    
     print("=" * 40)
+
+def _save_checkpoint_if_needed(runner: RLRunner, cfg: Config, epoch_id: int):
+    """根据配置决定是否保存模型检查点"""
+    save_every = getattr(cfg, 'save_every_epochs', 10)
+    checkpoint_dir = getattr(cfg, 'checkpoint_dir', './checkpoints')
+    keep_last_n = getattr(cfg, 'keep_last_n_checkpoints', 5)
+    
+    if epoch_id % save_every == 0:
+        # 创建检查点目录
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 保存模型
+        checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch_id:04d}.pt")
+        try:
+            runner.agent.save(checkpoint_path)
+            print(f"[CKPT] Model saved to: {checkpoint_path}")
+            
+            # 清理旧的检查点（保留最近的N个）
+            _cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
+            
+        except Exception as e:
+            print(f"[CKPT][WARN] Failed to save checkpoint: {e}")
+
+def _cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int):
+    """清理旧的检查点文件，只保留最近的N个"""
+    try:
+        import glob
+        pattern = os.path.join(checkpoint_dir, "model_epoch_*.pt")
+        checkpoint_files = glob.glob(pattern)
+        
+        if len(checkpoint_files) > keep_last_n:
+            # 按文件名排序（包含epoch编号）
+            checkpoint_files.sort()
+            files_to_remove = checkpoint_files[:-keep_last_n]
+            
+            for file_path in files_to_remove:
+                try:
+                    os.remove(file_path)
+                    print(f"[CKPT] Removed old checkpoint: {os.path.basename(file_path)}")
+                except Exception as e:
+                    print(f"[CKPT][WARN] Failed to remove {file_path}: {e}")
+                    
+    except Exception as e:
+        print(f"[CKPT][WARN] Failed to cleanup old checkpoints: {e}")
 
 def _run_one_video(runner: RLRunner, cfg: Config, argv: List[str], epoch_id: int, epoch_total: int):
     # 自动推导 2-pass 基线
@@ -137,7 +197,29 @@ def _run_one_video(runner: RLRunner, cfg: Config, argv: List[str], epoch_id: int
     
     # 编码完成后打印统计信息
     two_pass_stats, rl_stats = _get_epoch_stats(cfg, tp_path, runner)
-    _print_epoch_stats(epoch_id, two_pass_stats, rl_stats)
+    _print_epoch_stats(epoch_id, two_pass_stats, rl_stats, runner)
+    
+    # 检查是否需要保存模型
+    _save_checkpoint_if_needed(runner, cfg, epoch_id)
+
+def _save_final_model(runner: RLRunner, cfg: Config, final_epoch: int):
+    """保存最终训练完成的模型"""
+    checkpoint_dir = getattr(cfg, 'checkpoint_dir', './checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 保存最终模型
+    final_path = os.path.join(checkpoint_dir, f"model_final_epoch_{final_epoch:04d}.pt")
+    try:
+        runner.agent.save(final_path)
+        print(f"[CKPT] Final model saved to: {final_path}")
+        
+        # 也保存一个通用的最新模型
+        latest_path = os.path.join(checkpoint_dir, "model_latest.pt")
+        runner.agent.save(latest_path)
+        print(f"[CKPT] Latest model saved to: {latest_path}")
+        
+    except Exception as e:
+        print(f"[CKPT][WARN] Failed to save final model: {e}")
 
 def main():
     args = parse_args()
@@ -165,6 +247,12 @@ def main():
                 _run_one_video(runner, cfg, cmd_argv, epoch_id=eid, epoch_total=epoch_total)
                 eid += 1
         print("[MAIN] dataset training finished.")
+        # 训练结束后绘制最终图表
+        if hasattr(runner, '_plot_training_curves'):
+            runner._plot_training_curves()
+        # 保存最终模型
+        _save_final_model(runner, cfg, end_ep)
+        print(f"[MAIN] Training completed. Check logs at: {getattr(cfg, 'log_dir', './logs')}")
     else:
         # ===== 单视频命令模式（支持 --epochs）=====
         epoch_total = (end_ep - start_ep + 1) * max(1, len(args.videos))
@@ -176,6 +264,12 @@ def main():
                 _run_one_video(runner, cfg, argv, epoch_id=eid, epoch_total=epoch_total)
                 eid += 1
         print("[MAIN] single-video list finished.")
+        # 训练结束后绘制最终图表
+        if hasattr(runner, '_plot_training_curves'):
+            runner._plot_training_curves()
+        # 保存最终模型
+        _save_final_model(runner, cfg, end_ep)
+        print(f"[MAIN] Training completed. Check logs at: {getattr(cfg, 'log_dir', './logs')}")
 
 if __name__ == "__main__":
     main()

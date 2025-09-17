@@ -55,14 +55,23 @@ class Config:
     # 约束1：bit_avg ∈ [rate_band_low, rate_band_high] × ref_bit_avg
     rate_band_low: float = 0.90
     rate_band_high: float = 1.05
-    mg_bits_penalty_gain: float = 2.0            # 码率越界的惩罚斜率
+    mg_bits_penalty_gain: float = 2.0            # 码率越界的惩罚斜率（已废弃）
 
-    # 约束2：vmaf_avg ≥ ref_vmaf_avg
-    mg_vmaf_gain_pos: float = 0.20               # VMAF 高于参考的奖励斜率
-    mg_vmaf_gain_neg: float = 0.30               # VMAF 低于参考的惩罚斜率（通常更大）
-    end_penalty_scale: float = 1.0               # 在 episode 终止（gop_end==1）时放大奖惩
-    reward_clip: float = 3.0                     # 奖励裁剪阈值（对称）
-    reward_scale: float = 1.0                    # 全局缩放
+    # 硬约束惩罚参数
+    overbit_hard_penalty: float = 10.0           # 超过上限时的强惩罚值（已废弃）
+    overbit_bypass_clip: bool = True              # 硬惩罚是否绕过reward_clip
+    low_bit_penalty: float = 4.0                 # 低于下限时的惩罚强度（已废弃）
+    
+    # 双重硬约束参数（新设计）
+    hard_penalty_bitrate: float = 15.0           # 比特率违约强惩罚
+    hard_penalty_quality: float = 20.0           # 质量违约强惩罚（更重）
+
+    # 约束2：vmaf_avg ≥ ref_vmaf_avg（质量硬约束 + 奖励）
+    mg_vmaf_gain_pos: float = 0.30               # VMAF 高于参考的奖励斜率（只有正奖励）
+    mg_vmaf_gain_neg: float = 0.60               # 已废弃（现在用硬约束）
+    
+    # 比特率效率奖励
+    bit_efficiency_gain: float = 0.10            # 比特率效率奖励（越省比特率越好）
 
     # ===== 其它可选（兼容/备用）=====
     delta_qp_max: int = 20                       # 若改为 ΔQP 方案时可复用（当前为绝对 QP 向量输出）
@@ -75,6 +84,14 @@ class Config:
     # ===== 编码器日志 =====
     encoder_log_to_file: bool = True  # 打开文件日志
     encoder_log_dir: str = r"./logs/encoder"  # 日志目录
+    
+    # ===== 训练数据记录 =====
+    log_dir: str = r"./logs"  # 训练数据和图表保存目录
+    
+    # ===== 模型保存设置 =====
+    checkpoint_dir: str = r"./checkpoints"    # 模型保存目录
+    save_every_epochs: int = 10                # 每隔几个epoch保存一次模型
+    keep_last_n_checkpoints: int = 5           # 保留最近几个checkpoint
 
     # （可选）让日志文件名带上 epoch
     curr_epoch: int = 0  # main/runner 在每个 epoch 开始时更新它

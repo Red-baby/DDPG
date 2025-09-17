@@ -12,6 +12,9 @@ MiniGOP I/O runner:
 import os, glob, time, numpy as np, torch
 from dataclasses import dataclass
 from typing import Optional, Dict, List
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
 
 from utils import safe_read_json, safe_write_text, try_remove, now_ms, _float, _int
 from agent import get_agent
@@ -63,6 +66,16 @@ class RLRunner:
         self.epoch_start_env_steps = 0  # 初始化
         self.reset_epoch_stats()
         
+        # ===== Episode tracking =====
+        self.current_episode_return = 0.0
+        self.episode_returns = []  # 存储每个episode的return
+        self.loss_history = {"critic": [], "actor": []}  # 存储loss历史
+        self.training_metrics = {"episodes": [], "returns": [], "losses_c": [], "losses_a": [], "timestamps": []}
+        
+        # 创建日志目录
+        self.log_dir = getattr(cfg, "log_dir", "./logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+
     def reset_epoch_stats(self):
         """重置当前epoch的统计信息"""
         self.epoch_stats = {
@@ -81,7 +94,70 @@ class RLRunner:
             self.epoch_stats["vmaf_avg"] = self.epoch_stats["total_vmaf"] / self.epoch_stats["mg_count"]
             self.epoch_stats["bit_avg"] = self.epoch_stats["total_bits"] / self.epoch_stats["mg_count"]
         return self.epoch_stats.copy()
-
+        
+    def _save_training_data(self):
+        """保存训练数据到JSON文件"""
+        data_path = os.path.join(self.log_dir, "training_metrics.json")
+        try:
+            with open(data_path, 'w', encoding='utf-8') as f:
+                json.dump(self.training_metrics, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[RL][WARN] Failed to save training data: {e}")
+    
+    def _plot_training_curves(self):
+        """绘制训练曲线图"""
+        try:
+            if len(self.episode_returns) < 2:
+                return
+                
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+            
+            # 绘制episode return曲线
+            episodes = list(range(1, len(self.episode_returns) + 1))
+            ax1.plot(episodes, self.episode_returns, 'b-', alpha=0.7, label='Episode Return')
+            
+            # 计算滑动平均
+            if len(self.episode_returns) > 5:
+                window = min(10, len(self.episode_returns) // 2)
+                moving_avg = []
+                for i in range(len(self.episode_returns)):
+                    start_idx = max(0, i - window + 1)
+                    moving_avg.append(np.mean(self.episode_returns[start_idx:i+1]))
+                ax1.plot(episodes, moving_avg, 'r-', linewidth=2, label=f'Moving Average (window={window})')
+            
+            ax1.set_xlabel('Episode')
+            ax1.set_ylabel('Return')
+            ax1.set_title('Episode Return Over Time')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # 绘制loss曲线
+            if self.loss_ema_c is not None and self.loss_ema_a is not None:
+                loss_episodes = self.training_metrics["episodes"]
+                losses_c = self.training_metrics["losses_c"]
+                losses_a = self.training_metrics["losses_a"]
+                
+                if len(loss_episodes) > 1:
+                    ax2.plot(loss_episodes, losses_c, 'g-', alpha=0.7, label='Critic Loss')
+                    ax2.plot(loss_episodes, losses_a, 'orange', alpha=0.7, label='Actor Loss')
+                    ax2.set_xlabel('Episode')
+                    ax2.set_ylabel('Loss')
+                    ax2.set_title('Training Loss Over Time')
+                    ax2.legend()
+                    ax2.grid(True, alpha=0.3)
+                    ax2.set_yscale('log')  # 使用对数刻度
+            
+            plt.tight_layout()
+            
+            # 保存图片
+            plot_path = os.path.join(self.log_dir, f"training_curves_ep{len(self.episode_returns)}.png")
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"[RL] Training curves saved to {plot_path}")
+            
+        except Exception as e:
+            print(f"[RL][WARN] Failed to plot training curves: {e}")
     # --------------------- public API ---------------------
     def set_epoch(self, idx: int, total: int, twopass_log_path: Optional[str] = None):
         self.epoch_idx = int(idx); self.epoch_total = int(total)
@@ -254,10 +330,34 @@ class RLRunner:
 
             # reward
             r = compute_reward_mg(self.cfg, fb, ref)
+            
+            # 累积episode return
+            self.current_episode_return += r
 
             # terminal?
             done = (int(_int(fb.get("gop_end", fb.get("gopend", 0)))) == 1)
             pend.done = done
+            
+            # 如果episode结束，记录return并重置
+            if done:
+                self.episode_returns.append(self.current_episode_return)
+                print(f"[RL] Episode {len(self.episode_returns)} completed | Return: {self.current_episode_return:.4f}")
+                
+                # 记录训练指标
+                self.training_metrics["episodes"].append(len(self.episode_returns))
+                self.training_metrics["returns"].append(self.current_episode_return)
+                self.training_metrics["losses_c"].append(self.loss_ema_c if self.loss_ema_c is not None else 0.0)
+                self.training_metrics["losses_a"].append(self.loss_ema_a if self.loss_ema_a is not None else 0.0)
+                self.training_metrics["timestamps"].append(datetime.now().isoformat())
+                
+                # 保存训练数据
+                self._save_training_data()
+                
+                # 每10个episode绘制一次图
+                if len(self.episode_returns) % 10 == 0:
+                    self._plot_training_curves()
+                
+                self.current_episode_return = 0.0
 
             # next_state fallback
             s2 = pend.next_state if pend.next_state is not None else pend.state
